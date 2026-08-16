@@ -13,6 +13,10 @@ me, and I'm sharing it in case it helps you too.
 On Linux and macOS it downloads the official archive straight from `go.dev`,
 verifies the published SHA-256 checksum, and replaces `/usr/local/go` in place.
 
+It also works as a first-time installer: if you don't have Go yet, running it will
+fetch and install the latest version for you — no separate setup step. (That's also
+why it needs `sudo`: it writes to `/usr/local/go`.)
+
 ---
 
 ## Disclaimer
@@ -32,6 +36,8 @@ spot something wrong, please let me know (see [Contributing](#contributing)).
 - Verifies the official SHA-256 checksum of the downloaded tarball **before**
   touching your existing install — and aborts if it doesn't match.
 - Installs to `/usr/local/go` (the same location the official installers use).
+- Doubles as a first-time installer: if Go isn't installed yet, it just installs the
+  latest version for you — no separate "download the installer first" step.
 - Detects your shell from `$SHELL` and adds the right `PATH` lines:
   - **bash** → `~/.bashrc` (Linux) or `~/.bash_profile` (macOS)
   - **zsh** → `~/.zshrc`
@@ -107,10 +113,12 @@ update-go --force   # reinstall even if you're already on the latest version
 update-go --help    # show the help text
 ```
 
-**First run vs. upgrades:** if `go` is already on the latest version, the script
-will tell you you're up to date and exit (unless you pass `--force`). Otherwise
-it downloads the new version, verifies it, removes the old `/usr/local/go`, and
-extracts the new one.
+**First run vs. upgrades:** if `go` isn't installed at all, the script downloads
+the latest version, verifies it, and installs it fresh to `/usr/local/go` — so it
+works as a one-command installer the very first time. If `go` is already installed
+and on the latest version, it'll tell you you're up to date and exit (unless you
+pass `--force`). Otherwise it downloads the newer version, verifies it, removes the
+old `/usr/local/go`, and extracts the new one.
 
 **After it finishes,** you may need to open a new terminal (or `source` your
 profile — the script prints the exact command) before the updated `go` is on
