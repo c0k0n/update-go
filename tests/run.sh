@@ -185,14 +185,15 @@ fresh_sandbox() {
 run_case() { # $1=sandbox ; rest = script args (stdin is passed through)
     local sb="$1"; shift
     local run="${FAKE_SCRIPT:-$SCRIPT}"
-    # Both modes point UPDATE_GO_INSTALL_ROOT at the sandbox: in plain mode
-    # it redirects the install, in ns mode it matches the bind mount — so
+    # Hermetic environment: nothing from the host leaks in. XDG_CONFIG_HOME
+    # defaults into the sandbox (override per-scenario with FAKE_XDG);
+    # UPDATE_GO_INSTALL_ROOT points at the sandbox in both modes so
     # expectations are identical regardless of isolation mode.
     if [[ "$MODE" == "ns" ]]; then
         unshare --user --map-root-user --mount env \
             HOME="$sb/home" SHELL="${FAKE_SHELL:-/bin/zsh}" \
             FAKE_UNAME_S="${FAKE_UNAME_S:-}" FAKE_UNAME_M="${FAKE_UNAME_M:-}" \
-            XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}" \
+            XDG_CONFIG_HOME="${FAKE_XDG:-$sb/home/.config}" \
             UPDATE_GO_INSTALL_ROOT="$sb/usr/local" \
             PATH="$sb/stubs:$sb/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             bash -c "mount --bind '$sb/usr/local' /usr/local && exec '$run' $*" 2>&1
@@ -200,7 +201,7 @@ run_case() { # $1=sandbox ; rest = script args (stdin is passed through)
         env -i \
             HOME="$sb/home" SHELL="${FAKE_SHELL:-/bin/zsh}" \
             FAKE_UNAME_S="${FAKE_UNAME_S:-}" FAKE_UNAME_M="${FAKE_UNAME_M:-}" \
-            XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}" \
+            XDG_CONFIG_HOME="${FAKE_XDG:-$sb/home/.config}" \
             UPDATE_GO_INSTALL_ROOT="$sb/usr/local" \
             PATH="$sb/stubs:$sb/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             bash -c "exec '$run' $*" 2>&1
@@ -347,7 +348,7 @@ assert_file_has "$SB/home/.config/fish/config.fish" 'fish_add_path "$(go env GOP
 # ---------------------------------------------------------------
 say "S15: fish honors XDG_CONFIG_HOME"
 SB="$ROOT/s15"; fresh_sandbox "$SB"
-OUT="$(XDG_CONFIG_HOME=$SB/home/xdg FAKE_SHELL=/bin/fish run_case "$SB")"; RC=$?
+OUT="$(FAKE_XDG=$SB/home/xdg FAKE_SHELL=/bin/fish run_case "$SB")"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 [[ ! -e "$SB/home/.config/fish/config.fish" ]] && ok "default location untouched" || bad "wrote default location despite XDG override"
 assert_file_has "$SB/home/xdg/fish/config.fish" "fish_add_path $SB/usr/local/go/bin" "XDG config.fish has Go line"
@@ -361,9 +362,10 @@ if [[ $RC -eq 0 && "$OUT" == "update-go dev" ]]; then ok "reports 'update-go dev
 # ---------------------------------------------------------------
 say "S17: --version with workflow-stamped version"
 SB="$ROOT/s17"; fresh_sandbox "$SB"
-sed -i 's/__UPDATE_GO_VERSION__/TESTSTAMP/' "$SCRIPT"
-OUT="$(run_case "$SB" --version)"; RC=$?
-sed -i 's/VERSION="TESTSTAMP"/VERSION="__UPDATE_GO_VERSION__"/' "$SCRIPT"
+mkdir -p "$SB/bin"
+sed 's/__UPDATE_GO_VERSION__/TESTSTAMP/' "$SCRIPT" > "$SB/bin/update-go"
+chmod +x "$SB/bin/update-go"
+OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_case "$SB" --version)"; RC=$?
 if [[ $RC -eq 0 && "$OUT" == "update-go TESTSTAMP" ]]; then ok "reports stamped version"; else bad "got: $OUT"; fi
 
 # ---------------------------------------------------------------
