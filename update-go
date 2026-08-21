@@ -97,6 +97,8 @@ info "Detecting system architecture..."
 case "$(uname -m)" in
     x86_64|amd64) GOARCH="amd64" ;;
     aarch64|arm64) GOARCH="arm64" ;;
+    i386|i486|i586|i686) GOARCH="386" ;;
+    armv6l|armv7l) GOARCH="armv6l" ;;  # Go publishes one 32-bit ARM build; runs on v6 and v7
     *)
         error "Unsupported architecture: $(uname -m)"
         exit 1
@@ -148,7 +150,10 @@ info "Detected shell: $(basename "${SHELL:-/bin/bash}")  (editing $PROFILE)"
 # --------------------------------------------------
 
 info "Refreshing sudo credentials (needed to write to /usr/local/go)..."
-sudo -v
+if ! sudo -v; then
+    error "Could not get sudo permission to write to /usr/local/go."
+    exit 1
+fi
 
 # --------------------------------------------------
 # Latest release
@@ -156,28 +161,34 @@ sudo -v
 
 info "Fetching latest Go release information..."
 
-JSON="$(curl -fsSL "https://go.dev/dl/?mode=json")"
+if ! JSON="$(curl -fsSL --retry 3 --retry-delay 2 "https://go.dev/dl/?mode=json")"; then
+    error "Could not reach go.dev to fetch release information."
+    error "Check your internet connection and try again."
+    exit 1
+fi
 
 LATEST_VER="$(jq -r '.[0].version' <<< "$JSON")"
 
-EXPECTED_HASH="$(jq -r \
+read -r FILENAME EXPECTED_HASH <<< "$(jq -r \
     --arg os "$GOOS" \
     --arg arch "$GOARCH" \
     '
     .[0].files[]
     | select(.os == $os and .arch == $arch and .kind == "archive")
-    | .sha256
-    ' <<< "$JSON")"
+    | "\(.filename) \(.sha256)"
+    ' <<< "$JSON")" || true
 
 if [[ -z "$LATEST_VER" || "$LATEST_VER" == "null" ]]; then
     error "Failed to determine latest Go version."
     exit 1
 fi
 
-if [[ -z "$EXPECTED_HASH" || "$EXPECTED_HASH" == "null" ]]; then
-    error "Failed to determine the official checksum for $GOOS/$GOARCH."
+if [[ -z "$FILENAME" || -z "$EXPECTED_HASH" ]]; then
+    error "No official archive found for $GOOS/$GOARCH."
     exit 1
 fi
+
+DOWNLOAD_URL="https://go.dev/dl/${FILENAME}"
 
 success "Latest version: $LATEST_VER"
 
@@ -185,9 +196,19 @@ success "Latest version: $LATEST_VER"
 # Already up to date?
 # --------------------------------------------------
 
-if command -v go >/dev/null 2>&1; then
-    CURRENT_VER="$(go version | awk '{print $3}')"
+# Compare against the install this script manages (/usr/local/go), not
+# whatever "go" happens to be first on PATH (Homebrew, gvm, etc.).
+MANAGED_GO="/usr/local/go/bin/go"
+CURRENT_VER=""
 
+if [[ -x "$MANAGED_GO" ]]; then
+    CURRENT_VER="$("$MANAGED_GO" version 2>/dev/null | awk '{print $3}')" || true
+elif command -v go >/dev/null 2>&1; then
+    CURRENT_VER="$(go version 2>/dev/null | awk '{print $3}')" || true
+    warn "Found Go ($CURRENT_VER) outside /usr/local/go — installing a fresh copy there."
+fi
+
+if [[ -n "$CURRENT_VER" ]]; then
     if [[ "$CURRENT_VER" == "$LATEST_VER" && "$FORCE" -eq 0 ]]; then
         success "Go is already up to date ($CURRENT_VER). Nothing to do."
         echo
@@ -195,25 +216,23 @@ if command -v go >/dev/null 2>&1; then
         exit 0
     fi
 
-    if [[ "$CURRENT_VER" != "$LATEST_VER" ]]; then
-        warn "Current version: $CURRENT_VER"
-    fi
+    warn "Current version: $CURRENT_VER"
 fi
 
 # --------------------------------------------------
 # Download + verify
 # --------------------------------------------------
 
-TARBALL="${LATEST_VER}.${GOOS}-${GOARCH}.tar.gz"
-DOWNLOAD_URL="https://go.dev/dl/${TARBALL}"
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "$WORKDIR"' EXIT
 
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
+cd "$WORKDIR"
 
-cd "$TMPDIR"
-
-info "Downloading ${TARBALL}..."
-curl -fL --progress-bar -O "$DOWNLOAD_URL"
+info "Downloading ${FILENAME}..."
+if ! curl -fL --progress-bar --retry 3 --retry-delay 2 -O "$DOWNLOAD_URL"; then
+    error "Download failed. Check your internet connection and try again."
+    exit 1
+fi
 success "Download complete."
 
 info "Verifying checksum..."
@@ -221,12 +240,15 @@ info "Verifying checksum..."
 compute_sha256() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
-    else
+    elif command -v shasum >/dev/null 2>&1; then
         shasum -a 256 "$1" | awk '{print $1}'
+    else
+        error "Need 'sha256sum' or 'shasum' to verify the checksum, but neither was found."
+        return 1
     fi
 }
 
-ACTUAL_HASH="$(compute_sha256 "$TARBALL")"
+ACTUAL_HASH="$(compute_sha256 "$FILENAME")"
 
 if [[ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
     error "Checksum verification failed!"
@@ -246,56 +268,60 @@ info "Removing previous installation at /usr/local/go..."
 sudo rm -rf /usr/local/go
 
 info "Installing Go..."
-sudo tar -C /usr/local -xzf "$TARBALL"
+sudo tar -C /usr/local -xzf "$FILENAME"
 success "Installation complete."
+
+INSTALLED_VER="$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}')" || true
+if [[ "$INSTALLED_VER" != "$LATEST_VER" ]]; then
+    error "Installation looks wrong: /usr/local/go reports '${INSTALLED_VER:-unknown}', expected $LATEST_VER."
+    exit 1
+fi
 
 # --------------------------------------------------
 # PATH setup
 # --------------------------------------------------
 
 GO_BIN_LINE="/usr/local/go/bin"
+# shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
 GOPATH_BIN_LINE='$(go env GOPATH)/bin'
 
 mkdir -p "$(dirname "$PROFILE")"
 touch "$PROFILE"
 
-add_posix_path() {
-    local line="$1"
-    if ! grep -qxF "$line" "$PROFILE"; then
-        printf '%s\n' "$line" >> "$PROFILE"
-        return 0
-    fi
-    return 1
+profile_has() {
+    # True if the profile has a non-comment line mentioning $1.
+    grep -v '^[[:space:]]*#' "$PROFILE" 2>/dev/null | grep -qF "$1"
 }
 
-add_fish_path() {
-    local line="$1"
-    if ! grep -qxF "$line" "$PROFILE"; then
-        printf '%s\n' "$line" >> "$PROFILE"
-        return 0
+add_profile_line() {
+    printf '%s\n' "$1" >> "$PROFILE"
+}
+
+ensure_path_entry() {
+    local needle="$1" line="$2" label="$3"
+    if profile_has "$needle"; then
+        info "$label is already on PATH in $PROFILE."
+    else
+        add_profile_line "$line"
+        success "Added $label to PATH."
     fi
-    return 1
 }
 
 if [[ "$SHELL_FAMILY" == "fish" ]]; then
-    if add_fish_path "set -gx PATH /usr/local/go/bin \$PATH"; then
-        success "Added Go to PATH."
-    fi
-    if add_fish_path 'set -gx PATH $PATH (go env GOPATH)/bin'; then
-        success "Added GOPATH/bin to PATH."
-    fi
+    # shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
+    ensure_path_entry "$GO_BIN_LINE" "set -gx PATH $GO_BIN_LINE \$PATH" "Go"
+    # shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
+    ensure_path_entry "$GOPATH_BIN_LINE" 'set -gx PATH $PATH (go env GOPATH)/bin' "GOPATH/bin"
 else
-    if add_posix_path "export PATH=/usr/local/go/bin:\$PATH"; then
-        success "Added Go to PATH."
-    fi
-    if add_posix_path 'export PATH="$PATH:$(go env GOPATH)/bin"'; then
-        success "Added GOPATH/bin to PATH."
-    fi
+    ensure_path_entry "$GO_BIN_LINE" "export PATH=$GO_BIN_LINE:\$PATH" "Go"
+    # shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
+    ensure_path_entry "$GOPATH_BIN_LINE" 'export PATH="$PATH:$(go env GOPATH)/bin"' "GOPATH/bin"
 fi
 
 # Make the new binaries available in this session too.
 export PATH="/usr/local/go/bin:$PATH"
-export PATH="$PATH:$(/usr/local/go/bin/go env GOPATH)/bin"
+GOPATH_BIN="$(/usr/local/go/bin/go env GOPATH)/bin"
+export PATH="$PATH:$GOPATH_BIN"
 
 # --------------------------------------------------
 # Summary
@@ -307,7 +333,7 @@ echo
 echo "=============================================="
 success "Go installed successfully!"
 echo "=============================================="
-go version
+/usr/local/go/bin/go version
 echo
 echo "Architecture : $GOARCH"
 echo "OS           : $GOOS"

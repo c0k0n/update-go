@@ -1,0 +1,41 @@
+# Contributing
+
+Thanks for wanting to help! This is a small personal project, so the rules are
+small too.
+
+## Found a bug?
+
+Please [open an issue](https://github.com/c0k0n/update-go/issues) and include:
+
+- Your OS, architecture, and shell (`uname -s -m`, `echo $SHELL`)
+- The full output of the run
+- What you expected to happen instead
+
+If it's long or messy, a gist is perfect.
+
+**Security-related problems** (anything involving credentials, downloads, or
+system modification) — please don't open a public issue. See
+[SECURITY.md](SECURITY.md) instead.
+
+## Want to change something?
+
+For anything beyond a typo fix, an issue first is appreciated — it saves you
+from building something that won't get merged. Otherwise:
+
+1. Fork, branch, make your change. One idea per pull request, please.
+2. Make sure it passes the basics:
+
+   ```sh
+   bash -n update-go
+   shellcheck update-go   # should come back clean
+   ```
+
+3. **Test carefully.** This script removes `/usr/local/go` and edits shell
+   profiles — don't try it on your daily machine mid-development. A throwaway
+   VM, container, or sandbox is the right place.
+4. Open the pull request with a short description of *why*, not just *what*.
+
+## License
+
+By contributing, you agree that your changes are released under the project's
+[MIT License](LICENSE).
