@@ -26,9 +26,12 @@ from building something that won't get merged. Otherwise:
 2. Make sure it passes the basics:
 
    ```sh
-   bash -n update-go
-   shellcheck update-go   # should come back clean
+   bash -n update-go tests/run.sh
+   shellcheck update-go tests/run.sh   # should come back clean
    ```
+
+   CI runs exactly these checks plus the test suite on every pull request,
+   so green locally means green remotely.
 
 3. **Run the test suite.** It executes the real script against a sandbox —
    via an unprivileged user namespace when available, or HOME/install-root

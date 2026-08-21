@@ -18,7 +18,9 @@ profile](https://github.com/c0k0n) with:
 
 This script changes a system Go installation, edits shell configuration
 files, and — with `--update` — replaces itself using downloads from this
-project's GitHub releases. Anything in that area is fair game for a report.
+project's GitHub releases. Downloads happen over HTTPS and are checked
+against published checksums, so the whole chain — go.dev tarballs, checksum
+files, the self-update path — is fair game for a report.
 
 Please allow time for investigation before making a report public. Response
 and fixes are handled on a best-effort basis, for the latest release.

@@ -25,7 +25,8 @@ In the order it happens:
   specifically, so another `go` elsewhere on your `PATH` (Homebrew, version
   managers, …) won't fool it. No Go at all? It simply installs —
   the first run doubles as the installer.
-- Downloads the official tarball for your OS and architecture and checks its
+- Downloads the official tarball for your OS and architecture, sanity-checks
+  that the archive looks like what Go actually ships, and verifies its
   published SHA-256 checksum **before** touching anything. A mismatch stops
   everything, leaving your system exactly as it was.
 - Removes `/usr/local/go` and extracts the fresh archive — the same location,
@@ -46,9 +47,10 @@ In the order it happens:
   plain-language message telling you what to try next.
 - Won't fight itself: a lock file stops two copies from running at once.
 - Can update itself with `--update`: it fetches the newest release, verifies
-  it against the release's published `SHA256SUMS`, checks it over (shebang
-  and syntax) before touching anything, and replaces the running copy —
-  using `sudo` only if the install location needs it.
+  it against the release's published `SHA256SUMS` (telling you if that file
+  is unavailable), checks it over (shebang and syntax) before touching
+  anything, and replaces the running copy — using `sudo` only if the install
+  location needs it.
 - Can preview with `--check`: shows what it would do — versions, tarball,
   profile changes — without changing anything.
 - Can clean up after itself with `--uninstall`: removes `/usr/local/go` and
@@ -122,9 +124,9 @@ Anything else — Windows included — prints a clear message and exits.
 
 ## Uninstalling
 
-The easy way — it asks for confirmation, removes `/usr/local/go` and the
-`PATH` lines it added (and nothing else), and leaves your code and modules
-in `~/go` alone:
+The easy way — it asks for confirmation, then removes `/usr/local/go`, any
+leftover `/etc/paths.d/go`, and exactly the `PATH` lines it added. Your code
+and modules in `~/go` are never touched:
 
 ```sh
 update-go --uninstall
@@ -138,17 +140,11 @@ rm ~/.local/bin/update-go         # Linux
 sudo rm /usr/local/bin/update-go  # macOS
 
 sudo rm -rf /usr/local/go         # if you want Go itself gone too
+sudo rm -f /etc/paths.d/go        # if a macOS .pkg install left this behind
 ```
 
 Then feel free to delete the two `PATH` lines from your shell profile
 (`~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`).
-
-If a macOS `.pkg` install ever left an `/etc/paths.d/go` behind, it points at
-the same location this script uses — remove it with:
-
-```sh
-sudo rm -f /etc/paths.d/go
-```
 
 ## Contributing
 
