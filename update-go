@@ -150,9 +150,14 @@ EOF
 
 self_update() {
     local target="${BASH_SOURCE[0]}" dir self_path new_ver tmp_dir tmp_file
+    local hops=0
 
     # Follow symlinks so we replace the file that actually runs.
     while [[ -L "$target" ]]; do
+        if (( ++hops > 40 )); then
+            error "Too many levels of symlinks while locating this copy of update-go."
+            exit 1
+        fi
         dir="$(cd -- "$(dirname -- "$target")" && pwd)"
         target="$(readlink -- "$target")"
         [[ "$target" == /* ]] || target="$dir/$target"

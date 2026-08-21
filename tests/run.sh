@@ -81,7 +81,8 @@ build_fixtures() {
     local files_json f os arch h
     files_json='{"filename":"'"${VER}"'.src.tar.gz","os":"","arch":"","kind":"source","sha256":"deadbeef"}'
     for f in "${VER}.linux-amd64.tar.gz" "${VER}.linux-386.tar.gz" \
-             "${VER}.linux-armv6l.tar.gz" "${VER}.darwin-arm64.tar.gz"; do
+             "${VER}.linux-armv6l.tar.gz" "${VER}.darwin-amd64.tar.gz" \
+             "${VER}.darwin-arm64.tar.gz"; do
         tar --owner=0 --group=0 -C "$sb/tarball-src" -czf "$sb/$f" go
         os="${f#"${VER}".}"; os="${os%%-*}"
         arch="${f#"${VER}.${os}-"}"; arch="${arch%.tar.gz}"
@@ -352,6 +353,30 @@ OUT="$(FAKE_XDG=$SB/home/xdg FAKE_SHELL=/bin/fish run_case "$SB")"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 [[ ! -e "$SB/home/.config/fish/config.fish" ]] && ok "default location untouched" || bad "wrote default location despite XDG override"
 assert_file_has "$SB/home/xdg/fish/config.fish" "fish_add_path $SB/usr/local/go/bin" "XDG config.fish has Go line"
+
+# ---------------------------------------------------------------
+say "S35: Darwin bash writes .bash_profile, not .bashrc"
+SB="$ROOT/s35"; fresh_sandbox "$SB"
+OUT="$(FAKE_UNAME_S=Darwin FAKE_SHELL=/bin/bash run_case "$SB")"; RC=$?
+[[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
+assert_file_has "$SB/home/.bash_profile" "export PATH=$SB/usr/local/go/bin:\$PATH" ".bash_profile has Go line"
+[[ ! -e "$SB/home/.bashrc" ]] && ok ".bashrc untouched" || bad ".bashrc was created"
+
+# ---------------------------------------------------------------
+say "S36: unknown shell falls back to ~/.profile"
+SB="$ROOT/s36"; fresh_sandbox "$SB"
+OUT="$(FAKE_SHELL=/bin/ksh run_case "$SB")"; RC=$?
+[[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
+assert_file_has "$SB/home/.profile" "export PATH=$SB/usr/local/go/bin:\$PATH" ".profile has Go line"
+assert_file_has "$SB/home/.profile" 'export PATH="$PATH:$(go env GOPATH)/bin"' ".profile has GOPATH line"
+
+# ---------------------------------------------------------------
+say "S37: Linux bash writes .bashrc"
+SB="$ROOT/s37"; fresh_sandbox "$SB"
+OUT="$(FAKE_SHELL=/bin/bash run_case "$SB")"; RC=$?
+[[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
+assert_file_has "$SB/home/.bashrc" "export PATH=$SB/usr/local/go/bin:\$PATH" ".bashrc has Go line"
+[[ ! -e "$SB/home/.bash_profile" ]] && ok ".bash_profile untouched" || bad ".bash_profile was created"
 
 # ---------------------------------------------------------------
 say "S16: --version on unstamped copy"
