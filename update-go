@@ -21,9 +21,12 @@ esac
 # Where this project lives on GitHub (used by --update).
 REPO_SLUG="c0k0n/update-go"
 
-# The install this script manages, and the needles that identify its PATH lines.
-MANAGED_GO="/usr/local/go/bin/go"
-GO_BIN_NEEDLE="/usr/local/go/bin"
+# Root under which Go lives (/usr/local by default, matching the official
+# docs). Overridable so the test suite can exercise this exact script
+# against a sandbox instead of the machine's real /usr/local.
+INSTALL_ROOT="${UPDATE_GO_INSTALL_ROOT:-/usr/local}"
+MANAGED_GO="$INSTALL_ROOT/go/bin/go"
+GO_BIN_NEEDLE="$INSTALL_ROOT/go/bin"
 # shellcheck disable=SC2016  # intentionally literal: matched against profile lines
 GOPATH_NEEDLE='$(go env GOPATH)/bin'
 
@@ -234,33 +237,29 @@ self_update() {
 # Uninstall
 # --------------------------------------------------
 
-confirm() {
-    local reply
-    read -r -p "$1 [y/N] " reply || reply=""
-    [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
-}
-
 do_uninstall() {
     acquire_lock
 
     echo "This will:"
-    echo "  * remove /usr/local/go"
+    echo "  * remove $INSTALL_ROOT/go"
     [[ -f /etc/paths.d/go ]] && echo "  * remove /etc/paths.d/go (left by the macOS .pkg installer)"
     echo "  * remove the PATH lines update-go added to $PROFILE"
     echo
     echo "Your Go code, modules, and installed tools (e.g. ~/go) are NOT touched."
     echo
-    if ! confirm "Continue?"; then
+    local reply
+    read -r -p "Continue? [y/N] " reply || reply=""
+    if ! [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]; then
         info "Aborted — nothing was changed."
         exit 0
     fi
 
-    if [[ -e /usr/local/go ]]; then
-        info "Removing /usr/local/go..."
-        sudo rm -rf /usr/local/go
-        success "Removed /usr/local/go."
+    if [[ -e "$INSTALL_ROOT/go" ]]; then
+        info "Removing $INSTALL_ROOT/go..."
+        sudo rm -rf "$INSTALL_ROOT/go"
+        success "Removed $INSTALL_ROOT/go."
     else
-        info "/usr/local/go isn't present — skipping."
+        info "$INSTALL_ROOT/go isn't present — skipping."
     fi
 
     if [[ -f /etc/paths.d/go ]]; then
@@ -449,9 +448,9 @@ need jq
 # Permissions
 # --------------------------------------------------
 
-info "Refreshing sudo credentials (needed to write to /usr/local/go)..."
+info "Refreshing sudo credentials (needed to write to $INSTALL_ROOT/go)..."
 if ! sudo -v; then
-    error "Could not get sudo permission to write to /usr/local/go."
+    error "Could not get sudo permission to write to $INSTALL_ROOT/go."
     exit 1
 fi
 
@@ -512,7 +511,7 @@ fi
 # Already up to date?
 # --------------------------------------------------
 
-# Compare against the install this script manages (/usr/local/go), not
+# Compare against the install this script manages ($INSTALL_ROOT/go), not
 # whatever "go" happens to be first on PATH (Homebrew, gvm, etc.).
 CURRENT_VER=""
 
@@ -520,7 +519,7 @@ if [[ -x "$MANAGED_GO" ]]; then
     CURRENT_VER="$(go_version_of "$MANAGED_GO")"
 elif command -v go >/dev/null 2>&1; then
     CURRENT_VER="$(go_version_of "go")"
-    warn "Found Go ($CURRENT_VER) outside /usr/local/go — installing a fresh copy there."
+    warn "Found Go ($CURRENT_VER) outside $INSTALL_ROOT/go — installing a fresh copy there."
 fi
 
 # --------------------------------------------------
@@ -529,7 +528,7 @@ fi
 
 if [[ "$DO_CHECK" -eq 1 ]]; then
     echo
-    echo "  Latest Go        : $TARGET_VER"
+    echo "  Go release       : $TARGET_VER"
     echo "  Installed        : ${CURRENT_VER:-none}"
     if [[ -z "$CURRENT_VER" ]]; then
         echo "  Status           : not installed"
@@ -539,7 +538,7 @@ if [[ "$DO_CHECK" -eq 1 ]]; then
         echo "  Status           : update available"
     fi
     echo "  Would download   : $FILENAME"
-    echo "  Install location : /usr/local/go"
+    echo "  Install location : $INSTALL_ROOT/go"
     if profile_has "$GO_BIN_NEEDLE"; then
         echo "  Profile          : $PROFILE (PATH entries already present)"
     else
@@ -605,16 +604,16 @@ fi
 # Install
 # --------------------------------------------------
 
-info "Removing previous installation at /usr/local/go..."
-sudo rm -rf /usr/local/go
+info "Removing previous installation at $INSTALL_ROOT/go..."
+sudo rm -rf "$INSTALL_ROOT/go"
 
 info "Installing Go..."
-sudo tar -C /usr/local -xzf "$FILENAME"
+sudo tar -C "$INSTALL_ROOT" -xzf "$FILENAME"
 success "Installation complete."
 
-INSTALLED_VER="$(go_version_of "/usr/local/go/bin/go")"
+INSTALLED_VER="$(go_version_of "$MANAGED_GO")"
 if [[ "$INSTALLED_VER" != "$TARGET_VER" ]]; then
-    error "Installation looks wrong: /usr/local/go reports '${INSTALLED_VER:-unknown}', expected $TARGET_VER."
+    error "Installation looks wrong: $INSTALL_ROOT/go reports '${INSTALLED_VER:-unknown}', expected $TARGET_VER."
     exit 1
 fi
 
@@ -645,8 +644,8 @@ ensure_path_entry "$GO_BIN_NEEDLE" "$GO_LINE" "Go"
 ensure_path_entry "$GOPATH_NEEDLE" "$GOPATH_LINE" "GOPATH/bin"
 
 # Make the new binaries available in this session too.
-export PATH="/usr/local/go/bin:$PATH"
-GOPATH_BIN="$(/usr/local/go/bin/go env GOPATH)/bin"
+export PATH="$GO_BIN_NEEDLE:$PATH"
+GOPATH_BIN="$("$MANAGED_GO" env GOPATH)/bin"
 export PATH="$PATH:$GOPATH_BIN"
 
 # --------------------------------------------------
@@ -659,12 +658,12 @@ echo
 echo "=============================================="
 success "Go installed successfully!"
 echo "=============================================="
-/usr/local/go/bin/go version
+"$MANAGED_GO" version
 echo
 echo "Architecture : $GOARCH"
 echo "OS           : $GOOS"
 echo "Version      : $TARGET_VER"
-echo "Installed To : /usr/local/go"
+echo "Installed To : $INSTALL_ROOT/go"
 echo "Profile      : $PROFILE"
 echo "Time         : ${ELAPSED}s"
 echo

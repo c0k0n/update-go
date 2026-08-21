@@ -11,7 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The suite runs the real script inside an unprivileged user namespace
-      # with a fake /usr/local, so it never touches the runner's system.
+      # The suite auto-adapts to the environment: it prefers an unprivileged
+      # user namespace and falls back to HOME/install-root sandboxing where
+      # namespaces are blocked (e.g. GitHub-hosted runners). Either way the
+      # runner's system is never modified.
       - name: Run test suite
         run: tests/run.sh

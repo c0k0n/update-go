@@ -30,9 +30,9 @@ from building something that won't get merged. Otherwise:
    shellcheck update-go   # should come back clean
    ```
 
-3. **Run the test suite.** It executes the real script inside an
-   unprivileged user namespace with a fake `/usr/local`, so it's safe to run
-   anywhere:
+3. **Run the test suite.** It executes the real script against a sandbox —
+   via an unprivileged user namespace when available, or HOME/install-root
+   isolation otherwise — so it's safe to run anywhere:
 
    ```sh
    tests/run.sh

@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Sandboxed end-to-end tests for update-go.
 #
-# Runs the real script inside an unprivileged user namespace with a fake
-# /usr/local (bind-mounted), stubbed curl/sudo/uname, and fixture go.dev JSON.
-# No root and no network required; the host system is never touched.
+# Runs the real script against a sandboxed environment — stubbed curl/sudo/
+# uname, fixture go.dev JSON, and a fake install root — so no root and no
+# network are required, and the host system is never touched.
+#
+# Two isolation modes, chosen automatically (override with
+# UPDATE_GO_TESTS_MODE=ns|plain):
+#   ns    — an unprivileged user namespace with /usr/local bind-mounted to a
+#           sandbox (strongest; available on most Linux dev machines)
+#   plain — HOME + UPDATE_GO_INSTALL_ROOT sandboxing without a namespace
+#           (for environments like GitHub-hosted runners that block userns)
 #
 # Usage: tests/run.sh
 
@@ -25,12 +32,20 @@ FAIL=0
 for tool in jq sha256sum tar; do
     command -v "$tool" >/dev/null 2>&1 || { echo "tests: missing '$tool'"; exit 1; }
 done
-command -v unshare >/dev/null 2>&1 || { echo "tests: missing 'unshare'"; exit 1; }
-if ! unshare --user --map-root-user --mount true 2>/dev/null; then
-    echo "tests: unprivileged user namespaces are unavailable in this environment;"
-    echo "tests: the suite refuses to run the script against your real system."
-    exit 1
+
+MODE="${UPDATE_GO_TESTS_MODE:-auto}"
+if [[ "$MODE" == "auto" ]]; then
+    if command -v unshare >/dev/null 2>&1 && unshare --user --map-root-user --mount true 2>/dev/null; then
+        MODE="ns"
+    else
+        MODE="plain"
+    fi
 fi
+if [[ "$MODE" == "ns" ]]; then
+    command -v unshare >/dev/null 2>&1 || { echo "tests: missing 'unshare'"; exit 1; }
+    unshare --user --map-root-user --mount true 2>/dev/null || { echo "tests: user namespaces unavailable"; exit 1; }
+fi
+echo "tests: isolation mode = $MODE"
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/update-go-tests.XXXXXX")"
 trap 'rm -rf "$ROOT"' EXIT
@@ -82,7 +97,8 @@ EOF
 
 make_curl_stub() {
     local sb="$1" mode="$2"
-    # mode: ok | netfail-json | netfail-dl | badhash | badscript | badsums
+    # mode: ok | netfail-json | netfail-dl | netfail-self | badhash |
+    #       badscript | badsums | badlayout
     mkdir -p "$sb/stubs"
     cat > "$sb/stubs/curl" <<EOF
 #!/usr/bin/env bash
@@ -98,6 +114,7 @@ for a in "\$@"; do
       if [[ "$mode" == "netfail-json" ]]; then echo "curl: (7) connection refused" >&2; exit 7; fi
       cat "$sb/fixtures.json"; exit 0 ;;
     *releases/latest/download/update-go)
+      if [[ "$mode" == "netfail-self" ]]; then echo "curl: (7) connection refused" >&2; exit 7; fi
       if [[ "$mode" == "badscript" ]]; then printf 'definitely not a script\n' > "\$out"; exit 0; fi
       cp "$sb/fake-release" "\$out" && exit 0 ;;
     *releases/latest/download/SHA256SUMS)
@@ -109,6 +126,7 @@ for a in "\$@"; do
       exit 0 ;;
     https://go.dev/dl/*)
       if [[ "$mode" == "netfail-dl" ]]; then echo "curl: (7) connection refused" >&2; exit 7; fi
+      if [[ "$mode" == "badlayout" ]]; then cp "$sb/badlayout.tar.gz" "./\$(basename "\$a")" && exit 0; fi
       cp "$sb/\$(basename "\$a")" "./\$(basename "\$a")" && exit 0 ;;
   esac
 done
@@ -149,20 +167,39 @@ fresh_sandbox() {
     # A fake "latest release" of update-go itself (version 9.9.9) + its checksums.
     sed 's/__UPDATE_GO_VERSION__/9.9.9/' "$SCRIPT" > "$sb/fake-release"
     sha256sum "$sb/fake-release" | awk '{print $1 "  update-go"}' > "$sb/fake-SHA256SUMS"
+    # A tarball whose top-level directory is wrong (for the layout check).
+    rm -rf "$sb/badlayout-src"
+    mkdir -p "$sb/badlayout-src/notgo/bin"
+    make_go_stub "$VER" "$sb/badlayout-src/notgo/bin/go"
+    tar --owner=0 --group=0 -C "$sb/badlayout-src" -czf "$sb/badlayout.tar.gz" notgo
     make_curl_stub "$sb" "${2:-ok}"
     make_sudo_stub "$sb"
     make_uname_stub "$sb"
 }
 
-run_in_ns() { # $1=sandbox ; rest = script args (stdin is passed through)
+run_case() { # $1=sandbox ; rest = script args (stdin is passed through)
     local sb="$1"; shift
     local run="${FAKE_SCRIPT:-$SCRIPT}"
-    unshare --user --map-root-user --mount env \
-        HOME="$sb/home" SHELL="${FAKE_SHELL:-/bin/zsh}" \
-        FAKE_UNAME_S="${FAKE_UNAME_S:-}" FAKE_UNAME_M="${FAKE_UNAME_M:-}" \
-        XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}" \
-        PATH="$sb/stubs:$sb/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-        bash -c "mount --bind '$sb/usr/local' /usr/local && exec '$run' $*" 2>&1
+    # Both modes point UPDATE_GO_INSTALL_ROOT at the sandbox: in plain mode
+    # it redirects the install, in ns mode it matches the bind mount — so
+    # expectations are identical regardless of isolation mode.
+    if [[ "$MODE" == "ns" ]]; then
+        unshare --user --map-root-user --mount env \
+            HOME="$sb/home" SHELL="${FAKE_SHELL:-/bin/zsh}" \
+            FAKE_UNAME_S="${FAKE_UNAME_S:-}" FAKE_UNAME_M="${FAKE_UNAME_M:-}" \
+            XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}" \
+            UPDATE_GO_INSTALL_ROOT="$sb/usr/local" \
+            PATH="$sb/stubs:$sb/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            bash -c "mount --bind '$sb/usr/local' /usr/local && exec '$run' $*" 2>&1
+    else
+        env -i \
+            HOME="$sb/home" SHELL="${FAKE_SHELL:-/bin/zsh}" \
+            FAKE_UNAME_S="${FAKE_UNAME_S:-}" FAKE_UNAME_M="${FAKE_UNAME_M:-}" \
+            XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}" \
+            UPDATE_GO_INSTALL_ROOT="$sb/usr/local" \
+            PATH="$sb/stubs:$sb/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            bash -c "exec '$run' $*" 2>&1
+    fi
 }
 
 assert_file_has() { # $1=file $2=needle $3=label
@@ -180,18 +217,18 @@ assert_grep() { # $1=pattern $2=label (matches against $OUT)
 # ---------------------------------------------------------------
 say "S1: fresh install"
 SB="$ROOT/s1"; fresh_sandbox "$SB"
-OUT="$(run_in_ns "$SB")"; RC=$?
+OUT="$(run_case "$SB")"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "Checksum verified" "checksum verified"
 assert_grep "Added Go to PATH" "Go PATH line added"
 assert_grep "Added GOPATH/bin to PATH" "GOPATH line added"
 [[ -x "$SB/usr/local/go/bin/go" ]] && ok "installed into sandbox /usr/local/go" || bad "install missing"
-assert_file_has "$SB/home/.zshrc" 'export PATH=/usr/local/go/bin:$PATH' ".zshrc has Go line"
+assert_file_has "$SB/home/.zshrc" "export PATH=$SB/usr/local/go/bin:\$PATH" ".zshrc has Go line"
 assert_file_has "$SB/home/.zshrc" 'export PATH="$PATH:$(go env GOPATH)/bin"' ".zshrc has GOPATH line"
 
 # ---------------------------------------------------------------
 say "S2: already up to date (rerun after S1)"
-OUT="$(run_in_ns "$SB")"; RC=$?
+OUT="$(run_case "$SB")"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "already up to date" "reports up to date"
 assert_count "$SB/home/.zshrc" '/usr/local/go/bin' 1 "no duplicate PATH lines"
@@ -200,7 +237,7 @@ assert_count "$SB/home/.zshrc" '/usr/local/go/bin' 1 "no duplicate PATH lines"
 say "S3: upgrade from older /usr/local/go"
 SB="$ROOT/s3"; fresh_sandbox "$SB"
 make_go_stub "go1.98.0" "$SB/usr/local/go/bin/go"
-OUT="$(run_in_ns "$SB")"; RC=$?
+OUT="$(run_case "$SB")"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "Current version: go1.98.0" "shows old version"
 assert_grep "Latest version: $VER" "shows new version"
@@ -208,12 +245,12 @@ assert_grep "Latest version: $VER" "shows new version"
 # ---------------------------------------------------------------
 say "S4: profile pre-seeded with official-docs PATH lines"
 SB="$ROOT/s4"; fresh_sandbox "$SB"
-cat > "$SB/home/.zshrc" <<'EOF'
-# my rc
-export PATH=$PATH:/usr/local/go/bin
-export PATH="$PATH:$HOME/go/bin"
-EOF
-OUT="$(run_in_ns "$SB")"; RC=$?
+{
+    echo "# my rc"
+    echo "export PATH=\$PATH:$SB/usr/local/go/bin"
+    echo 'export PATH="$PATH:$HOME/go/bin"'
+} > "$SB/home/.zshrc"
+OUT="$(run_case "$SB")"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "already on PATH" "detects existing entry"
 assert_count "$SB/home/.zshrc" '/usr/local/go/bin' 1 "no duplicate Go line"
@@ -228,7 +265,7 @@ jq --arg f "${VER}.linux-amd64.tar.gz" \
    '(.[] | .files[] | select(.filename == $f) | .sha256) = "0000000000000000000000000000000000000000000000000000000000000000"' \
    "$SB/fixtures.json" > "$SB/fixtures.json.tmp" && mv "$SB/fixtures.json.tmp" "$SB/fixtures.json"
 make_go_stub "go1.98.0" "$SB/usr/local/go/bin/go"
-OUT="$(run_in_ns "$SB")"; RC=$?
+OUT="$(run_case "$SB")"; RC=$?
 [[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
 assert_grep "Checksum verification failed" "clear failure message"
 [[ -x "$SB/usr/local/go/bin/go" ]] && ok "old install untouched" || bad "old install destroyed!"
@@ -237,14 +274,14 @@ grep -q "go1.98.0" <("$SB/usr/local/go/bin/go" version) && ok "old version still
 # ---------------------------------------------------------------
 say "S6: release-info fetch failure"
 SB="$ROOT/s6"; fresh_sandbox "$SB" netfail-json
-OUT="$(run_in_ns "$SB")"; RC=$?
+OUT="$(run_case "$SB")"; RC=$?
 [[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
 assert_grep "Could not reach go.dev" "friendly error"
 
 # ---------------------------------------------------------------
 say "S7: tarball download failure"
 SB="$ROOT/s7"; fresh_sandbox "$SB" netfail-dl
-OUT="$(run_in_ns "$SB")"; RC=$?
+OUT="$(run_case "$SB")"; RC=$?
 [[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
 assert_grep "Download failed" "friendly error"
 
@@ -252,7 +289,7 @@ assert_grep "Download failed" "friendly error"
 say "S8: --force on up-to-date install"
 SB="$ROOT/s8"; fresh_sandbox "$SB"
 make_go_stub "$VER" "$SB/usr/local/go/bin/go"
-OUT="$(run_in_ns "$SB" --force)"; RC=$?
+OUT="$(run_case "$SB" --force)"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "Installation complete" "reinstalled with --force"
 assert_count "$SB/home/.zshrc" '/usr/local/go/bin' 1 "PATH not duplicated"
@@ -260,73 +297,73 @@ assert_count "$SB/home/.zshrc" '/usr/local/go/bin' 1 "PATH not duplicated"
 # ---------------------------------------------------------------
 say "S9: i686 maps to linux-386"
 SB="$ROOT/s9"; fresh_sandbox "$SB"
-OUT="$(FAKE_UNAME_M=i686 run_in_ns "$SB")"; RC=$?
+OUT="$(FAKE_UNAME_M=i686 run_case "$SB")"; RC=$?
 assert_grep "Downloading ${VER}.linux-386.tar.gz" "downloads 386 tarball"
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 
 # ---------------------------------------------------------------
 say "S10: armv7l maps to linux-armv6l"
 SB="$ROOT/s10"; fresh_sandbox "$SB"
-OUT="$(FAKE_UNAME_M=armv7l run_in_ns "$SB")"; RC=$?
+OUT="$(FAKE_UNAME_M=armv7l run_case "$SB")"; RC=$?
 assert_grep "Downloading ${VER}.linux-armv6l.tar.gz" "downloads armv6l tarball"
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 
 # ---------------------------------------------------------------
 say "S11: Darwin/arm64 downloads darwin tarball"
 SB="$ROOT/s11"; fresh_sandbox "$SB"
-OUT="$(FAKE_UNAME_S=Darwin FAKE_UNAME_M=arm64 run_in_ns "$SB")"; RC=$?
+OUT="$(FAKE_UNAME_S=Darwin FAKE_UNAME_M=arm64 run_case "$SB")"; RC=$?
 assert_grep "Downloading ${VER}.darwin-arm64.tar.gz" "downloads darwin tarball"
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
-assert_file_has "$SB/home/.zshrc" 'export PATH=/usr/local/go/bin:$PATH' ".zshrc has Go line"
+assert_file_has "$SB/home/.zshrc" "export PATH=$SB/usr/local/go/bin:\$PATH" ".zshrc has Go line"
 
 # ---------------------------------------------------------------
 say "S12: unsupported architecture exits cleanly"
 SB="$ROOT/s12"; fresh_sandbox "$SB"
-OUT="$(FAKE_UNAME_M=sparc64 run_in_ns "$SB")"; RC=$?
+OUT="$(FAKE_UNAME_M=sparc64 run_case "$SB")"; RC=$?
 [[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
 assert_grep "Unsupported architecture: sparc64" "names the arch"
 
 # ---------------------------------------------------------------
 say "S13: unsupported OS exits cleanly"
 SB="$ROOT/s13"; fresh_sandbox "$SB"
-OUT="$(FAKE_UNAME_S=FreeBSD run_in_ns "$SB")"; RC=$?
+OUT="$(FAKE_UNAME_S=FreeBSD run_case "$SB")"; RC=$?
 [[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
 assert_grep "supports Linux and macOS only" "friendly message"
 
 # ---------------------------------------------------------------
 say "S14: fish gets official fish_add_path lines"
 SB="$ROOT/s14"; fresh_sandbox "$SB"
-OUT="$(FAKE_SHELL=/bin/fish run_in_ns "$SB")"; RC=$?
+OUT="$(FAKE_SHELL=/bin/fish run_case "$SB")"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
-assert_file_has "$SB/home/.config/fish/config.fish" 'fish_add_path /usr/local/go/bin' "config.fish has fish_add_path Go line"
+assert_file_has "$SB/home/.config/fish/config.fish" "fish_add_path $SB/usr/local/go/bin" "config.fish has fish_add_path Go line"
 assert_file_has "$SB/home/.config/fish/config.fish" 'fish_add_path "$(go env GOPATH)/bin"' "config.fish has fish_add_path GOPATH line"
 
 # ---------------------------------------------------------------
 say "S15: fish honors XDG_CONFIG_HOME"
 SB="$ROOT/s15"; fresh_sandbox "$SB"
-OUT="$(XDG_CONFIG_HOME=$SB/home/xdg FAKE_SHELL=/bin/fish run_in_ns "$SB")"; RC=$?
+OUT="$(XDG_CONFIG_HOME=$SB/home/xdg FAKE_SHELL=/bin/fish run_case "$SB")"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 [[ ! -e "$SB/home/.config/fish/config.fish" ]] && ok "default location untouched" || bad "wrote default location despite XDG override"
-assert_file_has "$SB/home/xdg/fish/config.fish" 'fish_add_path /usr/local/go/bin' "XDG config.fish has Go line"
+assert_file_has "$SB/home/xdg/fish/config.fish" "fish_add_path $SB/usr/local/go/bin" "XDG config.fish has Go line"
 
 # ---------------------------------------------------------------
 say "S16: --version on unstamped copy"
 SB="$ROOT/s16"; fresh_sandbox "$SB"
-OUT="$(run_in_ns "$SB" --version)"; RC=$?
+OUT="$(run_case "$SB" --version)"; RC=$?
 if [[ $RC -eq 0 && "$OUT" == "update-go dev" ]]; then ok "reports 'update-go dev'"; else bad "got: $OUT"; fi
 
 # ---------------------------------------------------------------
 say "S17: --version with workflow-stamped version"
 SB="$ROOT/s17"; fresh_sandbox "$SB"
 sed -i 's/__UPDATE_GO_VERSION__/TESTSTAMP/' "$SCRIPT"
-OUT="$(run_in_ns "$SB" --version)"; RC=$?
+OUT="$(run_case "$SB" --version)"; RC=$?
 sed -i 's/VERSION="TESTSTAMP"/VERSION="__UPDATE_GO_VERSION__"/' "$SCRIPT"
 if [[ $RC -eq 0 && "$OUT" == "update-go TESTSTAMP" ]]; then ok "reports stamped version"; else bad "got: $OUT"; fi
 
 # ---------------------------------------------------------------
 say "S18: --help output"
 SB="$ROOT/s18"; fresh_sandbox "$SB"
-OUT="$(run_in_ns "$SB" --help)"; RC=$?
+OUT="$(run_case "$SB" --help)"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 for needle in "--force" "--check" "--update" "--uninstall" "--version" "--help" \
               "SHA-256" "/usr/local/go" "\$GOPATH/bin" "bash, zsh, or fish" \
@@ -337,7 +374,7 @@ done
 # ---------------------------------------------------------------
 say "S19: unknown option handled gracefully"
 SB="$ROOT/s19"; fresh_sandbox "$SB"
-OUT="$(run_in_ns "$SB" --bogus)"; RC=$?
+OUT="$(run_case "$SB" --bogus)"; RC=$?
 [[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
 assert_grep "Unknown option: --bogus" "names the bad option"
 assert_grep "Usage:" "shows help alongside error"
@@ -348,7 +385,7 @@ SB="$ROOT/s20"; fresh_sandbox "$SB"
 mkdir -p "$SB/bin"
 sed 's/__UPDATE_GO_VERSION__/1.0.0/' "$SCRIPT" > "$SB/bin/update-go"
 chmod +x "$SB/bin/update-go"
-OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_in_ns "$SB" --update)"; RC=$?
+OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_case "$SB" --update)"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "Updating update-go: 1.0.0 -> 9.9.9" "shows old -> new versions"
 assert_grep "Checksum verified" "verifies SHA256SUMS"
@@ -362,7 +399,7 @@ mkdir -p "$SB/bin"
 sed 's/__UPDATE_GO_VERSION__/9.9.9/' "$SCRIPT" > "$SB/bin/update-go"
 chmod +x "$SB/bin/update-go"
 cp "$SB/bin/update-go" "$SB/bin/before"
-OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_in_ns "$SB" --update)"; RC=$?
+OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_case "$SB" --update)"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "already up to date (9.9.9)" "reports up to date"
 cmp -s "$SB/bin/update-go" "$SB/bin/before" && ok "file untouched" || bad "file was modified"
@@ -373,7 +410,7 @@ SB="$ROOT/s22"; fresh_sandbox "$SB" badscript
 mkdir -p "$SB/bin"
 sed 's/__UPDATE_GO_VERSION__/1.0.0/' "$SCRIPT" > "$SB/bin/update-go"
 chmod +x "$SB/bin/update-go"
-OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_in_ns "$SB" --update)"; RC=$?
+OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_case "$SB" --update)"; RC=$?
 [[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
 assert_grep "didn't look like a working update-go" "friendly failure message"
 grep -q 'VERSION="1.0.0"' "$SB/bin/update-go" && ok "original copy untouched" || bad "original copy damaged"
@@ -382,7 +419,7 @@ grep -q 'VERSION="1.0.0"' "$SB/bin/update-go" && ok "original copy untouched" ||
 say "S23: --check when up to date changes nothing"
 SB="$ROOT/s23"; fresh_sandbox "$SB"
 make_go_stub "$VER" "$SB/usr/local/go/bin/go"
-OUT="$(run_in_ns "$SB" --check)"; RC=$?
+OUT="$(run_case "$SB" --check)"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "Status           : up to date" "reports up to date"
 assert_grep "Dry run — nothing was changed" "says it's a dry run"
@@ -392,7 +429,7 @@ assert_grep "Dry run — nothing was changed" "says it's a dry run"
 say "S24: --check when update available reports, doesn't touch"
 SB="$ROOT/s24"; fresh_sandbox "$SB"
 make_go_stub "go1.98.0" "$SB/usr/local/go/bin/go"
-OUT="$(run_in_ns "$SB" --check)"; RC=$?
+OUT="$(run_case "$SB" --check)"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "Status           : update available" "reports update available"
 assert_grep "Would download   : ${VER}.linux-amd64.tar.gz" "names the tarball"
@@ -403,12 +440,12 @@ grep -q "go1.98.0" <("$SB/usr/local/go/bin/go" version) && ok "install untouched
 # ---------------------------------------------------------------
 say "S25: specific version installs; unknown version fails kindly"
 SB="$ROOT/s25"; fresh_sandbox "$SB"
-OUT="$(run_in_ns "$SB" 1.27.0)"; RC=$?
+OUT="$(run_case "$SB" 1.27.0)"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_grep "Requested version: $VER" "shows requested version"
 [[ -x "$SB/usr/local/go/bin/go" ]] && ok "installed" || bad "not installed"
 SB="$ROOT/s25b"; fresh_sandbox "$SB"
-OUT="$(run_in_ns "$SB" 9.9.9)"; RC=$?
+OUT="$(run_case "$SB" 9.9.9)"; RC=$?
 [[ $RC -ne 0 ]] && ok "non-zero exit for unknown version" || bad "should have failed"
 assert_grep "go9.9.9 wasn't found among the stable releases" "friendly not-found message"
 
@@ -416,8 +453,13 @@ assert_grep "go9.9.9 wasn't found among the stable releases" "friendly not-found
 say "S26: --uninstall removes Go and its PATH lines after confirmation"
 SB="$ROOT/s26"; fresh_sandbox "$SB"
 make_go_stub "$VER" "$SB/usr/local/go/bin/go"
-printf '# my rc\nexport PATH=/usr/local/go/bin:$PATH\nexport PATH="$PATH:$(go env GOPATH)/bin"\nkeep me\n' > "$SB/home/.zshrc"
-OUT="$(echo y | run_in_ns "$SB" --uninstall)"; RC=$?
+{
+    echo "# my rc"
+    echo "export PATH=$SB/usr/local/go/bin:\$PATH"
+    echo 'export PATH="$PATH:$(go env GOPATH)/bin"'
+    echo "keep me"
+} > "$SB/home/.zshrc"
+OUT="$(echo y | run_case "$SB" --uninstall)"; RC=$?
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 [[ ! -e "$SB/usr/local/go" ]] && ok "/usr/local/go removed" || bad "/usr/local/go still present"
 assert_count "$SB/home/.zshrc" '/usr/local/go/bin' 0 "PATH lines removed"
@@ -427,7 +469,7 @@ assert_grep "Go has been uninstalled" "confirms uninstall"
 SB="$ROOT/s26b"; fresh_sandbox "$SB"
 make_go_stub "$VER" "$SB/usr/local/go/bin/go"
 echo 'export PATH=/usr/local/go/bin:$PATH' > "$SB/home/.zshrc"
-OUT="$(echo n | run_in_ns "$SB" --uninstall)"; RC=$?
+OUT="$(echo n | run_case "$SB" --uninstall)"; RC=$?
 [[ $RC -eq 0 ]] && ok "decline exits 0" || bad "decline exit code $RC"
 assert_grep "Aborted — nothing was changed" "respects decline"
 [[ -e "$SB/usr/local/go" ]] && ok "install kept on decline" || bad "removed despite decline"
@@ -436,7 +478,7 @@ assert_grep "Aborted — nothing was changed" "respects decline"
 say "S27: lockfile blocks a second mutating run"
 SB="$ROOT/s27"; fresh_sandbox "$SB"
 mkdir -p "${TMPDIR:-/tmp}/update-go.lock"
-OUT="$(run_in_ns "$SB")"; RC=$?
+OUT="$(run_case "$SB")"; RC=$?
 rmdir "${TMPDIR:-/tmp}/update-go.lock"
 [[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
 assert_grep "Another update-go appears to be running" "explains the lock"
@@ -448,10 +490,71 @@ SB="$ROOT/s28"; fresh_sandbox "$SB" badsums
 mkdir -p "$SB/bin"
 sed 's/__UPDATE_GO_VERSION__/1.0.0/' "$SCRIPT" > "$SB/bin/update-go"
 chmod +x "$SB/bin/update-go"
-OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_in_ns "$SB" --update)"; RC=$?
+OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_case "$SB" --update)"; RC=$?
 [[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
 assert_grep "Checksum verification failed for the downloaded update-go" "names the failure"
 grep -q 'VERSION="1.0.0"' "$SB/bin/update-go" && ok "original copy untouched" || bad "original copy damaged"
+
+# ---------------------------------------------------------------
+say "S29: --update survives a download failure"
+SB="$ROOT/s29"; fresh_sandbox "$SB" netfail-self
+mkdir -p "$SB/bin"
+sed 's/__UPDATE_GO_VERSION__/1.0.0/' "$SCRIPT" > "$SB/bin/update-go"
+chmod +x "$SB/bin/update-go"
+OUT="$(FAKE_SCRIPT="$SB/bin/update-go" run_case "$SB" --update)"; RC=$?
+[[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
+assert_grep "Couldn't download the latest update-go from GitHub" "friendly error"
+grep -q 'VERSION="1.0.0"' "$SB/bin/update-go" && ok "original copy untouched" || bad "original copy damaged"
+
+# ---------------------------------------------------------------
+say "S30: wrong archive layout aborts, install untouched"
+SB="$ROOT/s30"; fresh_sandbox "$SB" badlayout
+# Serve a well-checksummed tarball whose top-level directory is wrong,
+# so the layout check is what catches it (checksum runs first).
+NEW_HASH="$(sha256sum "$SB/badlayout.tar.gz" | awk '{print $1}')"
+jq --arg f "${VER}.linux-amd64.tar.gz" --arg h "$NEW_HASH" \
+   '(.[] | .files[] | select(.filename == $f) | .sha256) = $h' \
+   "$SB/fixtures.json" > "$SB/fixtures.json.tmp" && mv "$SB/fixtures.json.tmp" "$SB/fixtures.json"
+make_go_stub "go1.98.0" "$SB/usr/local/go/bin/go"
+OUT="$(run_case "$SB")"; RC=$?
+[[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
+assert_grep "Unexpected archive layout (top-level 'notgo', expected 'go')" "names the problem"
+assert_grep "Nothing was changed" "promises no changes"
+grep -q "go1.98.0" <("$SB/usr/local/go/bin/go" version) && ok "old install untouched" || bad "old install damaged"
+
+# ---------------------------------------------------------------
+say "S31: --uninstall when Go isn't installed"
+SB="$ROOT/s31"; fresh_sandbox "$SB"
+printf '# my rc\nkeep me\n' > "$SB/home/.zshrc"
+OUT="$(echo y | run_case "$SB" --uninstall)"; RC=$?
+[[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
+assert_grep "isn't present — skipping" "skips missing install gracefully"
+assert_grep "No update-go PATH lines found" "reports nothing to clean"
+grep -q "keep me" "$SB/home/.zshrc" && ok "profile untouched" || bad "profile modified"
+
+# ---------------------------------------------------------------
+say "S32: extra positional argument rejected"
+SB="$ROOT/s32"; fresh_sandbox "$SB"
+OUT="$(run_case "$SB" 1.27.0 1.26.0)"; RC=$?
+[[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
+assert_grep "Unexpected extra argument: 1.26.0" "names the extra argument"
+
+# ---------------------------------------------------------------
+say "S33: malformed version string rejected"
+SB="$ROOT/s33"; fresh_sandbox "$SB"
+OUT="$(run_case "$SB" abc123)"; RC=$?
+[[ $RC -ne 0 ]] && ok "non-zero exit" || bad "should have failed"
+assert_grep "'goabc123' doesn't look like a Go version" "explains the problem"
+
+# ---------------------------------------------------------------
+say "S34: --check runs even while another copy holds the lock"
+SB="$ROOT/s34"; fresh_sandbox "$SB"
+make_go_stub "$VER" "$SB/usr/local/go/bin/go"
+mkdir -p "${TMPDIR:-/tmp}/update-go.lock"
+OUT="$(run_case "$SB" --check)"; RC=$?
+rmdir "${TMPDIR:-/tmp}/update-go.lock"
+[[ $RC -eq 0 ]] && ok "exit code 0 (lock skipped for read-only)" || bad "exit code $RC"
+assert_grep "Status           : up to date" "still reports status"
 
 # ---------------------------------------------------------------
 echo
