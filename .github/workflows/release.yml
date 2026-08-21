@@ -1,0 +1,31 @@
+name: Release
+
+# Cut a release by pushing a version tag:
+#   git tag v1.0.1 && git push origin v1.0.1
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Sanity-check the script
+        run: |
+          bash -n update-go
+          shellcheck update-go
+
+      - name: Create release with the script attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "update-go ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            update-go

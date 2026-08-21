@@ -67,7 +67,7 @@ Drop the script somewhere on your `PATH` and make it executable.
 Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/c0k0n/update-go/main/update-go -o ~/.local/bin/update-go && chmod +x ~/.local/bin/update-go
+curl -fsSL https://github.com/c0k0n/update-go/releases/latest/download/update-go -o ~/.local/bin/update-go && chmod +x ~/.local/bin/update-go
 ```
 
 Make sure `~/.local/bin` is on your `PATH` (most distros include it by
@@ -76,7 +76,7 @@ default).
 macOS:
 
 ```sh
-sudo curl -fsSL https://raw.githubusercontent.com/c0k0n/update-go/main/update-go -o /usr/local/bin/update-go && sudo chmod +x /usr/local/bin/update-go
+sudo curl -fsSL https://github.com/c0k0n/update-go/releases/latest/download/update-go -o /usr/local/bin/update-go && sudo chmod +x /usr/local/bin/update-go
 ```
 
 (`/usr/local/bin` is on the default `PATH` on macOS. You can also use `~/bin`
