@@ -1,0 +1,22 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ShellCheck
+        run: |
+          shellcheck update-go
+          shellcheck tests/run.sh
+
+      - name: Syntax check
+        run: |
+          bash -n update-go
+          bash -n tests/run.sh

@@ -21,9 +21,31 @@ esac
 # Where this project lives on GitHub (used by --update).
 REPO_SLUG="c0k0n/update-go"
 
-# Anything left in here is wiped when the script exits, however it ends.
+# The install this script manages, and the needles that identify its PATH lines.
+MANAGED_GO="/usr/local/go/bin/go"
+GO_BIN_NEEDLE="/usr/local/go/bin"
+# shellcheck disable=SC2016  # intentionally literal: matched against profile lines
+GOPATH_NEEDLE='$(go env GOPATH)/bin'
+
+# Temp dir + lock are cleaned up however the script ends.
 CLEANUP_DIR=""
-trap '[[ -n "$CLEANUP_DIR" ]] && rm -rf "$CLEANUP_DIR"' EXIT
+LOCK_PATH="${TMPDIR:-/tmp}/update-go.lock"
+LOCK_HELD=0
+cleanup() {
+    [[ -n "$CLEANUP_DIR" ]] && rm -rf "$CLEANUP_DIR"
+    [[ "$LOCK_HELD" -eq 1 ]] && rmdir "$LOCK_PATH" 2>/dev/null
+    return 0
+}
+trap cleanup EXIT
+
+acquire_lock() {
+    if ! mkdir "$LOCK_PATH" 2>/dev/null; then
+        error "Another update-go appears to be running ($LOCK_PATH)."
+        error "If that's wrong, remove the lock directory and try again."
+        exit 1
+    fi
+    LOCK_HELD=1
+}
 
 START_TIME="$(date +%s)"
 
@@ -47,10 +69,10 @@ success() { echo "${GREEN}✔${RESET} $*"; }
 warn()    { echo "${YELLOW}⚠${RESET} $*"; }
 error()   { echo "${RED}✖${RESET} $*" >&2; }
 
-# curl with sane defaults: fail on HTTP errors, follow redirects,
-# ride out brief network hiccups.
+# curl with sane defaults: HTTPS only, modern TLS, fail on HTTP errors,
+# follow redirects, ride out brief network hiccups.
 fetch() {
-    curl -fL --retry 3 --retry-delay 2 "$@"
+    curl -fL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 "$@"
 }
 
 # Print the version (e.g. go1.27.0) reported by the given Go binary.
@@ -58,21 +80,52 @@ go_version_of() {
     "$1" version 2>/dev/null | awk '{print $3}' || true
 }
 
+# Print the SHA-256 of a file using whichever tool the system provides.
+compute_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        error "Need 'sha256sum' or 'shasum' to verify a checksum, but neither was found."
+        return 1
+    fi
+}
+
+# True if the profile has a non-comment line mentioning $1.
+# Pure bash (no pipes) so an early match can't trip up pipefail.
+profile_has() {
+    local needle="$1" line
+    [[ -r "$PROFILE" ]] || return 1
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" == *"$needle"* ]] && return 0
+    done < "$PROFILE"
+    return 1
+}
+
 usage() {
     cat <<'EOF'
 update-go — update (or install) the Go toolchain from go.dev
 
 Usage:
-  update-go [options]
+  update-go [options] [version]
 
 Options:
-  -f, --force     Reinstall even if already on the latest version
+  -f, --force     Reinstall even if already on the requested version
+  -n, --check     Show what would happen, change nothing
   -u, --update    Update update-go itself to the latest release
+      --uninstall Remove Go and the PATH lines update-go added
   -V, --version   Show the version of update-go and exit
   -h, --help      Show this help and exit
 
+Examples:
+  update-go              Install or update to the latest Go
+  update-go 1.25.4       Install a specific version (stable releases only)
+  update-go --check      Preview the update without changing anything
+
 How it works:
-  1. Looks up the latest Go release on go.dev
+  1. Looks up the release on go.dev (latest, or the one you asked for)
   2. Downloads the official tarball for your OS and architecture
   3. Verifies its published SHA-256 checksum
   4. Replaces /usr/local/go with the fresh version
@@ -131,6 +184,22 @@ self_update() {
         exit 1
     fi
 
+    # Verify against the release's published checksums when available.
+    local sums_file="$tmp_dir/SHA256SUMS" expected actual
+    if fetch -s -o "$sums_file" \
+            "https://github.com/$REPO_SLUG/releases/latest/download/SHA256SUMS"; then
+        expected="$(awk '$2 == "update-go" {print $1}' "$sums_file")"
+        actual="$(compute_sha256 "$tmp_file")"
+        if [[ -z "$expected" || "$actual" != "$expected" ]]; then
+            error "Checksum verification failed for the downloaded update-go."
+            error "Nothing was changed — please try again later."
+            exit 1
+        fi
+        success "Checksum verified."
+    else
+        warn "Couldn't fetch SHA256SUMS — continuing without an integrity check."
+    fi
+
     new_ver="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' "$tmp_file" | head -n 1)"
     case "$new_ver" in
         ""|__*) new_ver="unknown" ;;
@@ -162,50 +231,113 @@ self_update() {
 }
 
 # --------------------------------------------------
+# Uninstall
+# --------------------------------------------------
+
+confirm() {
+    local reply
+    read -r -p "$1 [y/N] " reply || reply=""
+    [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+do_uninstall() {
+    acquire_lock
+
+    echo "This will:"
+    echo "  * remove /usr/local/go"
+    [[ -f /etc/paths.d/go ]] && echo "  * remove /etc/paths.d/go (left by the macOS .pkg installer)"
+    echo "  * remove the PATH lines update-go added to $PROFILE"
+    echo
+    echo "Your Go code, modules, and installed tools (e.g. ~/go) are NOT touched."
+    echo
+    if ! confirm "Continue?"; then
+        info "Aborted — nothing was changed."
+        exit 0
+    fi
+
+    if [[ -e /usr/local/go ]]; then
+        info "Removing /usr/local/go..."
+        sudo rm -rf /usr/local/go
+        success "Removed /usr/local/go."
+    else
+        info "/usr/local/go isn't present — skipping."
+    fi
+
+    if [[ -f /etc/paths.d/go ]]; then
+        sudo rm -f /etc/paths.d/go
+        success "Removed /etc/paths.d/go."
+    fi
+
+    if [[ -f "$PROFILE" ]]; then
+        # Only strip lines identical to the ones this script adds — anything
+        # you wrote yourself stays. Rewriting the original file in place keeps
+        # its permissions.
+        local tmp removed before after
+        tmp="$(mktemp)"
+        CLEANUP_DIR="$tmp"
+        grep -vFx -e "$GO_LINE" -e "$GOPATH_LINE" "$PROFILE" > "$tmp" || true
+        before="$(wc -l < "$PROFILE")"
+        after="$(wc -l < "$tmp")"
+        removed=$(( before - after ))
+        if (( removed > 0 )); then
+            cat "$tmp" > "$PROFILE"
+            success "Removed $removed PATH line(s) from $PROFILE."
+        else
+            info "No update-go PATH lines found in $PROFILE."
+        fi
+    fi
+
+    success "Go has been uninstalled."
+    echo "Restart any open terminal sessions for the changes to take effect."
+}
+
+# --------------------------------------------------
 # Argument parsing
 # --------------------------------------------------
 
 FORCE=0
 DO_UPDATE=0
+DO_CHECK=0
+DO_UNINSTALL=0
+REQUESTED_VER=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -f|--force)   FORCE=1 ;;
+        -n|--check)   DO_CHECK=1 ;;
         -u|--update)  DO_UPDATE=1 ;;
+        --uninstall)  DO_UNINSTALL=1 ;;
         -V|--version) echo "update-go $VERSION"; exit 0 ;;
         -h|--help)    usage; exit 0 ;;
-        *)
+        -*)
             error "Unknown option: $1"
             echo
             usage
             exit 1
             ;;
+        *)
+            if [[ -n "$REQUESTED_VER" ]]; then
+                error "Unexpected extra argument: $1"
+                exit 1
+            fi
+            REQUESTED_VER="$1"
+            ;;
     esac
     shift
 done
+
+if [[ -n "$REQUESTED_VER" ]]; then
+    [[ "$REQUESTED_VER" == go* ]] || REQUESTED_VER="go$REQUESTED_VER"
+    if ! [[ "$REQUESTED_VER" =~ ^go[0-9]+([.][0-9]+){0,2}$ ]]; then
+        error "'$REQUESTED_VER' doesn't look like a Go version (e.g. 1.25.4 or go1.25.4)."
+        exit 1
+    fi
+fi
 
 if [[ "$DO_UPDATE" -eq 1 ]]; then
     self_update
     exit 0
 fi
-
-# --------------------------------------------------
-# Required tools
-# --------------------------------------------------
-
-need() {
-    if ! command -v "$1" >/dev/null 2>&1; then
-        error "This script needs '$1', but it was not found on your system."
-        case "$1" in
-            jq)      error "Install it with:  brew install jq   (macOS)  or  sudo apt install jq   (Debian/Ubuntu)" ;;
-            curl)    error "Install curl and try again." ;;
-        esac
-        exit 1
-    fi
-}
-
-need curl
-need jq
 
 # --------------------------------------------------
 # Detect platform
@@ -243,10 +375,10 @@ esac
 detect_shell() {
     SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
 
+    # POSIX-style defaults; fish overrides these below.
     case "$SHELL_NAME" in
         zsh)
             PROFILE="$HOME/.zshrc"
-            SHELL_FAMILY="posix"
             ;;
         bash)
             # macOS bash is usually a login shell (uses .bash_profile).
@@ -255,25 +387,63 @@ detect_shell() {
             else
                 PROFILE="$HOME/.bashrc"
             fi
-            SHELL_FAMILY="posix"
             ;;
         fish)
             # fish reads $XDG_CONFIG_HOME/fish/config.fish, which defaults
             # to ~/.config/fish/config.fish.
             PROFILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
-            SHELL_FAMILY="fish"
             ;;
         *)
             PROFILE="$HOME/.profile"
-            SHELL_FAMILY="posix"
             ;;
     esac
+
+    if [[ "$SHELL_NAME" == "fish" ]]; then
+        # fish_add_path is fish's official helper: it deduplicates entries
+        # and keeps them ahead of the system paths.
+        GO_LINE="fish_add_path $GO_BIN_NEEDLE"
+        # shellcheck disable=SC2016  # intentionally literal: expanded by fish later
+        GOPATH_LINE='fish_add_path "$(go env GOPATH)/bin"'
+    else
+        GO_LINE="export PATH=$GO_BIN_NEEDLE:\$PATH"
+        # shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
+        GOPATH_LINE='export PATH="$PATH:$(go env GOPATH)/bin"'
+    fi
 
     SOURCE_CMD="source \"$PROFILE\""
 }
 
 detect_shell
 info "Detected shell: $SHELL_NAME  (editing $PROFILE)"
+
+if [[ "$DO_UNINSTALL" -eq 1 ]]; then
+    do_uninstall
+    exit 0
+fi
+
+# Mutating runs take a lock so two copies can't fight over /usr/local/go.
+# (--check is read-only and skips it.)
+if [[ "$DO_CHECK" -eq 0 ]]; then
+    acquire_lock
+fi
+
+# --------------------------------------------------
+# Required tools
+# --------------------------------------------------
+
+need() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        error "This script needs '$1', but it was not found on your system."
+        case "$1" in
+            jq)      error "Install it with:  brew install jq   (macOS)  or  sudo apt install jq   (Debian/Ubuntu)" ;;
+            curl)    error "Install curl and try again." ;;
+        esac
+        exit 1
+    fi
+}
+
+need curl
+need jq
 
 # --------------------------------------------------
 # Permissions
@@ -289,7 +459,7 @@ fi
 # Latest release
 # --------------------------------------------------
 
-info "Fetching latest Go release information..."
+info "Fetching release information from go.dev..."
 
 if ! JSON="$(fetch -s "https://go.dev/dl/?mode=json")"; then
     error "Could not reach go.dev to fetch release information."
@@ -299,30 +469,44 @@ fi
 
 # A proxy or captive portal can serve non-JSON junk; treat parse failures
 # as "no data" so the checks below can report it kindly.
-LATEST_VER="$(jq -r '.[0].version' <<< "$JSON" 2>/dev/null)" || true
+if [[ -n "$REQUESTED_VER" ]]; then
+    TARGET_VER="$REQUESTED_VER"
+else
+    TARGET_VER="$(jq -r '.[0].version' <<< "$JSON" 2>/dev/null)" || true
+fi
 
 read -r FILENAME EXPECTED_HASH <<< "$(jq -r \
     --arg os "$GOOS" \
     --arg arch "$GOARCH" \
+    --arg ver "$TARGET_VER" \
     '
-    .[0].files[]
+    .[] | select(.version == $ver) | .files[]
     | select(.os == $os and .arch == $arch and .kind == "archive")
     | "\(.filename) \(.sha256)"
     ' <<< "$JSON")" || true
 
-if [[ -z "$LATEST_VER" || "$LATEST_VER" == "null" ]]; then
-    error "Failed to determine latest Go version."
+if [[ -z "$TARGET_VER" || "$TARGET_VER" == "null" ]]; then
+    error "Failed to determine the Go version to install."
     exit 1
 fi
 
 if [[ -z "$FILENAME" || -z "$EXPECTED_HASH" ]]; then
-    error "No official archive found for $GOOS/$GOARCH."
+    if [[ -n "$REQUESTED_VER" ]]; then
+        error "Go $REQUESTED_VER wasn't found among the stable releases."
+        error "See https://go.dev/dl/ for the available versions."
+    else
+        error "No official archive found for $GOOS/$GOARCH."
+    fi
     exit 1
 fi
 
 DOWNLOAD_URL="https://go.dev/dl/${FILENAME}"
 
-success "Latest version: $LATEST_VER"
+if [[ -n "$REQUESTED_VER" ]]; then
+    success "Requested version: $TARGET_VER"
+else
+    success "Latest version: $TARGET_VER"
+fi
 
 # --------------------------------------------------
 # Already up to date?
@@ -330,7 +514,6 @@ success "Latest version: $LATEST_VER"
 
 # Compare against the install this script manages (/usr/local/go), not
 # whatever "go" happens to be first on PATH (Homebrew, gvm, etc.).
-MANAGED_GO="/usr/local/go/bin/go"
 CURRENT_VER=""
 
 if [[ -x "$MANAGED_GO" ]]; then
@@ -340,8 +523,35 @@ elif command -v go >/dev/null 2>&1; then
     warn "Found Go ($CURRENT_VER) outside /usr/local/go — installing a fresh copy there."
 fi
 
+# --------------------------------------------------
+# --check: report, change nothing
+# --------------------------------------------------
+
+if [[ "$DO_CHECK" -eq 1 ]]; then
+    echo
+    echo "  Latest Go        : $TARGET_VER"
+    echo "  Installed        : ${CURRENT_VER:-none}"
+    if [[ -z "$CURRENT_VER" ]]; then
+        echo "  Status           : not installed"
+    elif [[ "$CURRENT_VER" == "$TARGET_VER" ]]; then
+        echo "  Status           : up to date"
+    else
+        echo "  Status           : update available"
+    fi
+    echo "  Would download   : $FILENAME"
+    echo "  Install location : /usr/local/go"
+    if profile_has "$GO_BIN_NEEDLE"; then
+        echo "  Profile          : $PROFILE (PATH entries already present)"
+    else
+        echo "  Profile          : $PROFILE (PATH entries would be added)"
+    fi
+    echo
+    info "Dry run — nothing was changed."
+    exit 0
+fi
+
 if [[ -n "$CURRENT_VER" ]]; then
-    if [[ "$CURRENT_VER" == "$LATEST_VER" && "$FORCE" -eq 0 ]]; then
+    if [[ "$CURRENT_VER" == "$TARGET_VER" && "$FORCE" -eq 0 ]]; then
         success "Go is already up to date ($CURRENT_VER). Nothing to do."
         echo
         echo "Pass --force to reinstall the same version anyway."
@@ -367,17 +577,6 @@ success "Download complete."
 
 info "Verifying checksum..."
 
-compute_sha256() {
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | awk '{print $1}'
-    else
-        error "Need 'sha256sum' or 'shasum' to verify the checksum, but neither was found."
-        return 1
-    fi
-}
-
 ACTUAL_HASH="$(compute_sha256 "$FILENAME")"
 
 if [[ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
@@ -389,6 +588,18 @@ if [[ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
 fi
 
 success "Checksum verified."
+
+# Sanity-check the archive layout before touching anything: the official
+# tarballs always extract to a single top-level directory named "go".
+info "Inspecting archive..."
+ARCHIVE_LIST="$(tar -tzf "$FILENAME")"
+TOP_DIR="${ARCHIVE_LIST%%$'\n'*}"
+TOP_DIR="${TOP_DIR%%/*}"
+if [[ "$TOP_DIR" != "go" ]]; then
+    error "Unexpected archive layout (top-level '$TOP_DIR', expected 'go')."
+    error "Nothing was changed — please try again later."
+    exit 1
+fi
 
 # --------------------------------------------------
 # Install
@@ -402,8 +613,8 @@ sudo tar -C /usr/local -xzf "$FILENAME"
 success "Installation complete."
 
 INSTALLED_VER="$(go_version_of "/usr/local/go/bin/go")"
-if [[ "$INSTALLED_VER" != "$LATEST_VER" ]]; then
-    error "Installation looks wrong: /usr/local/go reports '${INSTALLED_VER:-unknown}', expected $LATEST_VER."
+if [[ "$INSTALLED_VER" != "$TARGET_VER" ]]; then
+    error "Installation looks wrong: /usr/local/go reports '${INSTALLED_VER:-unknown}', expected $TARGET_VER."
     exit 1
 fi
 
@@ -411,24 +622,8 @@ fi
 # PATH setup
 # --------------------------------------------------
 
-GO_BIN_LINE="/usr/local/go/bin"
-# shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
-GOPATH_BIN_LINE='$(go env GOPATH)/bin'
-
 mkdir -p "$(dirname "$PROFILE")"
 touch "$PROFILE"
-
-profile_has() {
-    # True if the profile has a non-comment line mentioning $1.
-    # Pure bash (no pipes) so an early match can't trip up pipefail.
-    local needle="$1" line
-    [[ -r "$PROFILE" ]] || return 1
-    while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ "$line" == *"$needle"* ]] && return 0
-    done < "$PROFILE"
-    return 1
-}
 
 add_profile_line() {
     printf '%s\n' "$1" >> "$PROFILE"
@@ -444,17 +639,10 @@ ensure_path_entry() {
     fi
 }
 
-if [[ "$SHELL_FAMILY" == "fish" ]]; then
-    # fish_add_path is fish's official helper: it deduplicates entries and
-    # keeps them ahead of the system paths.
-    ensure_path_entry "$GO_BIN_LINE" "fish_add_path $GO_BIN_LINE" "Go"
-    # shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
-    ensure_path_entry "$GOPATH_BIN_LINE" 'fish_add_path "$(go env GOPATH)/bin"' "GOPATH/bin"
-else
-    ensure_path_entry "$GO_BIN_LINE" "export PATH=$GO_BIN_LINE:\$PATH" "Go"
-    # shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
-    ensure_path_entry "$GOPATH_BIN_LINE" 'export PATH="$PATH:$(go env GOPATH)/bin"' "GOPATH/bin"
-fi
+# The exact lines are defined per-shell in detect_shell(), so --uninstall
+# can find and remove precisely what we add here.
+ensure_path_entry "$GO_BIN_NEEDLE" "$GO_LINE" "Go"
+ensure_path_entry "$GOPATH_NEEDLE" "$GOPATH_LINE" "GOPATH/bin"
 
 # Make the new binaries available in this session too.
 export PATH="/usr/local/go/bin:$PATH"
@@ -475,7 +663,7 @@ echo "=============================================="
 echo
 echo "Architecture : $GOARCH"
 echo "OS           : $GOOS"
-echo "Version      : $LATEST_VER"
+echo "Version      : $TARGET_VER"
 echo "Installed To : /usr/local/go"
 echo "Profile      : $PROFILE"
 echo "Time         : ${ELAPSED}s"

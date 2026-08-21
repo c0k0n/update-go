@@ -1,0 +1,17 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The suite runs the real script inside an unprivileged user namespace
+      # with a fake /usr/local, so it never touches the runner's system.
+      - name: Run test suite
+        run: tests/run.sh

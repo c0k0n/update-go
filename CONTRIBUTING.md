@@ -30,9 +30,17 @@ from building something that won't get merged. Otherwise:
    shellcheck update-go   # should come back clean
    ```
 
-3. **Test carefully.** This script removes `/usr/local/go` and edits shell
-   profiles — don't try it on your daily machine mid-development. A throwaway
-   VM, container, or sandbox is the right place.
+3. **Run the test suite.** It executes the real script inside an
+   unprivileged user namespace with a fake `/usr/local`, so it's safe to run
+   anywhere:
+
+   ```sh
+   tests/run.sh
+   ```
+
+   Even so, don't skip manual testing in a throwaway VM or container for
+   anything that touches installation or profiles — the suite is thorough,
+   but real systems are creative.
 4. Don't hand-edit the `VERSION` placeholder near the top of `update-go`.
    The release workflow stamps the version in automatically when a release
    is cut; unstamped copies simply report `dev`.

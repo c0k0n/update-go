@@ -18,12 +18,12 @@ to do it for me, and I'm sharing it in case it helps you too.
 
 In the order it happens:
 
-- Asks `go.dev` for the latest release — nothing is hardcoded, so it always
-  finds whatever shipped most recently.
-- Checks what you have now. Already on the latest? It says so and stops
+- Asks `go.dev` for the release you want — the latest by default, or any
+  specific stable version (`update-go 1.25.4`). Nothing else is hardcoded.
+- Checks what you have now. Already on it? It says so and stops
   (unless you pass `--force`). The check looks at `/usr/local/go`
   specifically, so another `go` elsewhere on your `PATH` (Homebrew, version
-  managers, …) won't fool it. No Go at all? It simply installs the latest —
+  managers, …) won't fool it. No Go at all? It simply installs —
   the first run doubles as the installer.
 - Downloads the official tarball for your OS and architecture and checks its
   published SHA-256 checksum **before** touching anything. A mismatch stops
@@ -44,9 +44,16 @@ In the order it happens:
   even if you added Go to your `PATH` by hand long ago.
 - Retries flaky downloads a few times, and every failure exits with a
   plain-language message telling you what to try next.
-- Can update itself with `--update`: it fetches the newest release, checks it
-  over (shebang and syntax) before touching anything, and replaces the running
-  copy — using `sudo` only if the install location needs it.
+- Won't fight itself: a lock file stops two copies from running at once.
+- Can update itself with `--update`: it fetches the newest release, verifies
+  it against the release's published `SHA256SUMS`, checks it over (shebang
+  and syntax) before touching anything, and replaces the running copy —
+  using `sudo` only if the install location needs it.
+- Can preview with `--check`: shows what it would do — versions, tarball,
+  profile changes — without changing anything.
+- Can clean up after itself with `--uninstall`: removes `/usr/local/go` and
+  the exact PATH lines it added (after asking you first). Your code and
+  modules in `~/go` are never touched.
 
 ## Requirements
 
@@ -88,11 +95,14 @@ if you prefer.)
 ## Usage
 
 ```sh
-update-go            # update (or first-time install) to the latest Go
-update-go --force    # reinstall even if already on the latest version
-update-go --update   # update update-go itself to the latest release
-update-go --version  # show which release of update-go you're running
-update-go --help     # show the help text
+update-go              # update (or first-time install) to the latest Go
+update-go 1.25.4       # install a specific version (stable releases only)
+update-go --check      # preview what would happen, change nothing
+update-go --force      # reinstall even if already on the requested version
+update-go --update     # update update-go itself to the latest release
+update-go --uninstall  # remove Go and the PATH lines update-go added
+update-go --version    # show which release of update-go you're running
+update-go --help       # show the help text
 ```
 
 Released copies know their own version (the release automation stamps it in);
@@ -112,22 +122,26 @@ Anything else — Windows included — prints a clear message and exits.
 
 ## Uninstalling
 
-There's nothing to "uninstall" as such — it's one script:
+The easy way — it asks for confirmation, removes `/usr/local/go` and the
+`PATH` lines it added (and nothing else), and leaves your code and modules
+in `~/go` alone:
+
+```sh
+update-go --uninstall
+```
+
+Or by hand — it's one script:
 
 ```sh
 rm ~/.local/bin/update-go         # Linux
 # or
 sudo rm /usr/local/bin/update-go  # macOS
+
+sudo rm -rf /usr/local/go         # if you want Go itself gone too
 ```
 
-If you also want to remove Go itself:
-
-```sh
-sudo rm -rf /usr/local/go
-```
-
-And feel free to delete the two `PATH` lines the script added to your shell
-profile (`~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`).
+Then feel free to delete the two `PATH` lines from your shell profile
+(`~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`).
 
 If a macOS `.pkg` install ever left an `/etc/paths.d/go` behind, it points at
 the same location this script uses — remove it with:

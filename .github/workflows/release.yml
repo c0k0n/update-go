@@ -25,6 +25,10 @@ jobs:
         run: |
           sed -i "s/__UPDATE_GO_VERSION__/${GITHUB_REF_NAME#v}/" update-go
 
+      - name: Generate checksums
+        run: |
+          sha256sum update-go > SHA256SUMS
+
       - name: Create release with the script attached
         env:
           GH_TOKEN: ${{ github.token }}
@@ -32,4 +36,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "update-go ${GITHUB_REF_NAME#v}" \
             --generate-notes \
-            update-go
+            update-go SHA256SUMS
