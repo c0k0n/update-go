@@ -11,6 +11,20 @@
 
 set -euo pipefail
 
+# This placeholder is replaced with the release tag by the release workflow.
+# An unstamped copy (run straight from the repository) reports "dev".
+VERSION="__UPDATE_GO_VERSION__"
+case "$VERSION" in
+    __*) VERSION="dev" ;;
+esac
+
+# Where this project lives on GitHub (used by --update).
+REPO_SLUG="c0k0n/update-go"
+
+# Anything left in here is wiped when the script exits, however it ends.
+CLEANUP_DIR=""
+trap '[[ -n "$CLEANUP_DIR" ]] && rm -rf "$CLEANUP_DIR"' EXIT
+
 START_TIME="$(date +%s)"
 
 # --------------------------------------------------
@@ -30,18 +44,106 @@ error()   { echo -e "${RED}✖${RESET} $*" >&2; }
 
 usage() {
     cat <<'EOF'
-update-go — update the Go toolchain from go.dev
+update-go — update (or install) the Go toolchain from go.dev
 
 Usage:
   update-go [options]
 
 Options:
   -f, --force     Reinstall even if already on the latest version
-  -h, --help      Show this help
+  -u, --update    Update update-go itself to the latest release
+  -V, --version   Show the version of update-go and exit
+  -h, --help      Show this help and exit
 
-The script installs to /usr/local/go and adds it (plus $GOPATH/bin) to the
-PATH of the shell it detects from $SHELL (bash, zsh, or fish).
+How it works:
+  1. Looks up the latest Go release on go.dev
+  2. Downloads the official tarball for your OS and architecture
+  3. Verifies its published SHA-256 checksum
+  4. Replaces /usr/local/go with the fresh version
+  5. Makes sure /usr/local/go/bin and $GOPATH/bin are on your PATH
+
+Good to know:
+  * Needs curl, jq, and sudo (writing to /usr/local/go requires root)
+  * Supports Linux and macOS, with bash, zsh, or fish
+  * Safe to re-run: if you're already current, it simply says so
+  * --update refreshes update-go itself from GitHub releases
+
+Docs & issues: https://github.com/c0k0n/update-go
 EOF
+}
+
+# --------------------------------------------------
+# Self-update
+# --------------------------------------------------
+
+self_update() {
+    local target="${BASH_SOURCE[0]}"
+    local dir self_path new_ver tmp_dir tmp_file
+
+    # Follow symlinks so we replace the file that actually runs.
+    while [[ -L "$target" ]]; do
+        dir="$(cd -- "$(dirname -- "$target")" && pwd)"
+        target="$(readlink -- "$target")"
+        [[ "$target" == /* ]] || target="$dir/$target"
+    done
+    dir="$(cd -- "$(dirname -- "$target")" && pwd)"
+    self_path="$dir/$(basename -- "$target")"
+
+    if [[ ! -f "$self_path" ]]; then
+        error "Couldn't locate this copy of update-go on disk ($self_path)."
+        error "You can install the latest version manually with:"
+        error "  curl -fsSL https://github.com/$REPO_SLUG/releases/latest/download/update-go -o ~/.local/bin/update-go"
+        exit 1
+    fi
+
+    info "Checking for a newer version of update-go..."
+
+    tmp_dir="$(mktemp -d)"
+    CLEANUP_DIR="$tmp_dir"
+    tmp_file="$tmp_dir/update-go.new"
+
+    if ! curl -fsSL --retry 3 --retry-delay 2 \
+            -o "$tmp_file" "https://github.com/$REPO_SLUG/releases/latest/download/update-go"; then
+        error "Couldn't download the latest update-go from GitHub."
+        error "Check your internet connection and try again."
+        exit 1
+    fi
+
+    # Only touch the running copy if the download looks like a healthy script.
+    if ! head -n 1 "$tmp_file" | grep -q '^#!' || ! bash -n "$tmp_file"; then
+        error "The downloaded file didn't look like a working update-go."
+        error "Nothing was changed — please try again later."
+        exit 1
+    fi
+
+    new_ver="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' "$tmp_file" | head -n 1)"
+    case "$new_ver" in
+        ""|__*) new_ver="unknown" ;;
+    esac
+
+    if [[ "$new_ver" == "$VERSION" ]]; then
+        success "update-go is already up to date ($VERSION)."
+        return 0
+    fi
+
+    info "Updating update-go: $VERSION -> $new_ver"
+
+    # curl writes 0644; make sure the replacement stays executable.
+    chmod +x "$tmp_file"
+
+    if [[ -w "$dir" ]]; then
+        mv -f "$tmp_file" "$self_path"
+    else
+        info "No write permission for $dir — using sudo."
+        if ! sudo mv -f "$tmp_file" "$self_path"; then
+            error "Couldn't replace $self_path."
+            exit 1
+        fi
+    fi
+
+    success "update-go updated to $new_ver."
+    echo
+    echo "Check it with: update-go --version"
 }
 
 # --------------------------------------------------
@@ -49,15 +151,28 @@ EOF
 # --------------------------------------------------
 
 FORCE=0
+DO_UPDATE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -f|--force) FORCE=1 ;;
-        -h|--help)  usage; exit 0 ;;
-        *) error "Unknown option: $1"; usage; exit 1 ;;
+        -f|--force)   FORCE=1 ;;
+        -u|--update)  DO_UPDATE=1 ;;
+        -V|--version) echo "update-go $VERSION"; exit 0 ;;
+        -h|--help)    usage; exit 0 ;;
+        *)
+            error "Unknown option: $1"
+            echo
+            usage
+            exit 1
+            ;;
     esac
     shift
 done
+
+if [[ "$DO_UPDATE" -eq 1 ]]; then
+    self_update
+    exit 0
+fi
 
 # --------------------------------------------------
 # Required tools
@@ -225,10 +340,8 @@ fi
 # Download + verify
 # --------------------------------------------------
 
-WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
-
-cd "$WORKDIR"
+CLEANUP_DIR="$(mktemp -d)"
+cd "$CLEANUP_DIR"
 
 info "Downloading ${FILENAME}..."
 if ! curl -fL --progress-bar --retry 3 --retry-delay 2 -O "$DOWNLOAD_URL"; then

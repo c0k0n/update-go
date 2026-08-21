@@ -21,6 +21,10 @@ jobs:
           bash -n update-go
           shellcheck update-go
 
+      - name: Stamp the release version into the script
+        run: |
+          sed -i "s/__UPDATE_GO_VERSION__/${GITHUB_REF_NAME#v}/" update-go
+
       - name: Create release with the script attached
         env:
           GH_TOKEN: ${{ github.token }}

@@ -45,6 +45,9 @@ In the order it happens:
   latest.
 - Retries flaky downloads a few times, and every failure exits with a
   plain-language message telling you what to try next.
+- Can update itself with `--update`: it fetches the newest release, checks it
+  over (shebang and syntax) before touching anything, and replaces the running
+  copy — using `sudo` only if the install location needs it.
 
 ## Requirements
 
@@ -86,10 +89,15 @@ if you prefer.)
 ## Usage
 
 ```sh
-update-go          # update (or first-time install) to the latest Go
-update-go --force  # reinstall even if already on the latest version
-update-go --help   # show the help text
+update-go            # update (or first-time install) to the latest Go
+update-go --force    # reinstall even if already on the latest version
+update-go --update   # update update-go itself to the latest release
+update-go --version  # show which release of update-go you're running
+update-go --help     # show the help text
 ```
+
+Released copies know their own version (the release automation stamps it in);
+a copy run straight from the repository reports `dev`.
 
 When it finishes, open a new terminal (or source your profile — the script
 prints the exact command) so existing shells pick up the updated `go`.
