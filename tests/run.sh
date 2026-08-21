@@ -53,6 +53,11 @@ trap 'rm -rf "$ROOT"' EXIT
 say() { printf '\n=== %s ===\n' "$1"; }
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  FAIL: %s\n' "$1"; FAIL=$((FAIL+1)); }
+VERBOSE="${UPDATE_GO_TESTS_VERBOSE:-0}"
+show() { # echo captured output of the last run when verbose
+    [[ "$VERBOSE" == 1 ]] && printf '%s\n' "$OUT" | sed 's/^/  | /'
+    return 0
+}
 
 make_go_stub() { # $1 = version string to report, $2 = destination path
     local dest="$2"
@@ -334,6 +339,7 @@ assert_grep "supports Linux and macOS only" "friendly message"
 say "S14: fish gets official fish_add_path lines"
 SB="$ROOT/s14"; fresh_sandbox "$SB"
 OUT="$(FAKE_SHELL=/bin/fish run_case "$SB")"; RC=$?
+show
 [[ $RC -eq 0 ]] && ok "exit code 0" || bad "exit code $RC"
 assert_file_has "$SB/home/.config/fish/config.fish" "fish_add_path $SB/usr/local/go/bin" "config.fish has fish_add_path Go line"
 assert_file_has "$SB/home/.config/fish/config.fish" 'fish_add_path "$(go env GOPATH)/bin"' "config.fish has fish_add_path GOPATH line"

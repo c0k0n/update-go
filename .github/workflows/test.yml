@@ -16,4 +16,6 @@ jobs:
       # namespaces are blocked (e.g. GitHub-hosted runners). Either way the
       # runner's system is never modified.
       - name: Run test suite
+        env:
+          UPDATE_GO_TESTS_VERBOSE: 1
         run: tests/run.sh
