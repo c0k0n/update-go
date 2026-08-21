@@ -33,7 +33,10 @@ from building something that won't get merged. Otherwise:
 3. **Test carefully.** This script removes `/usr/local/go` and edits shell
    profiles — don't try it on your daily machine mid-development. A throwaway
    VM, container, or sandbox is the right place.
-4. Open the pull request with a short description of *why*, not just *what*.
+4. Don't hand-edit the `VERSION` placeholder near the top of `update-go`.
+   The release workflow stamps the version in automatically when a release
+   is cut; unstamped copies simply report `dev`.
+5. Open the pull request with a short description of *why*, not just *what*.
 
 ## License
 

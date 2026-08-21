@@ -20,6 +20,11 @@ In the order it happens:
 
 - Asks `go.dev` for the latest release — nothing is hardcoded, so it always
   finds whatever shipped most recently.
+- Checks what you have now. Already on the latest? It says so and stops
+  (unless you pass `--force`). The check looks at `/usr/local/go`
+  specifically, so another `go` elsewhere on your `PATH` (Homebrew, version
+  managers, …) won't fool it. No Go at all? It simply installs the latest —
+  the first run doubles as the installer.
 - Downloads the official tarball for your OS and architecture and checks its
   published SHA-256 checksum **before** touching anything. A mismatch stops
   everything, leaving your system exactly as it was.
@@ -37,12 +42,6 @@ In the order it happens:
 
   Lines your profile already has are skipped, so nothing gets duplicated —
   even if you added Go to your `PATH` by hand long ago.
-- Tells you you're already up to date and exits, instead of reinstalling the
-  same version (unless you pass `--force`). The check looks at `/usr/local/go`
-  specifically, so another `go` elsewhere on your `PATH` (Homebrew, version
-  managers, …) won't fool it.
-- Doubles as a first-time installer: no Go yet? Running it just installs the
-  latest.
 - Retries flaky downloads a few times, and every failure exits with a
   plain-language message telling you what to try next.
 - Can update itself with `--update`: it fetches the newest release, checks it
@@ -109,7 +108,7 @@ prints the exact command) so existing shells pick up the updated `go`.
 | Linux   | `amd64`, `arm64`, `386`, `armv6l`   | bash, zsh, fish |
 | macOS   | Intel `amd64`, Apple Silicon `arm64` | bash, zsh, fish |
 
-Anything else — Windows included — exits with a friendly message.
+Anything else — Windows included — prints a clear message and exits.
 
 ## Uninstalling
 

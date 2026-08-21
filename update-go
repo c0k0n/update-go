@@ -31,16 +31,32 @@ START_TIME="$(date +%s)"
 # Presentation
 # --------------------------------------------------
 
-GREEN="\033[1;32m"
-BLUE="\033[1;34m"
-YELLOW="\033[1;33m"
-RED="\033[1;31m"
-RESET="\033[0m"
+# Color only real terminals — keep piped/CI output clean.
+if [[ -t 1 ]]; then
+    GREEN=$'\033[1;32m'
+    BLUE=$'\033[1;34m'
+    YELLOW=$'\033[1;33m'
+    RED=$'\033[1;31m'
+    RESET=$'\033[0m'
+else
+    GREEN=""; BLUE=""; YELLOW=""; RED=""; RESET=""
+fi
 
-info()    { echo -e "${BLUE}==>${RESET} $*"; }
-success() { echo -e "${GREEN}✔${RESET} $*"; }
-warn()    { echo -e "${YELLOW}⚠${RESET} $*"; }
-error()   { echo -e "${RED}✖${RESET} $*" >&2; }
+info()    { echo "${BLUE}==>${RESET} $*"; }
+success() { echo "${GREEN}✔${RESET} $*"; }
+warn()    { echo "${YELLOW}⚠${RESET} $*"; }
+error()   { echo "${RED}✖${RESET} $*" >&2; }
+
+# curl with sane defaults: fail on HTTP errors, follow redirects,
+# ride out brief network hiccups.
+fetch() {
+    curl -fL --retry 3 --retry-delay 2 "$@"
+}
+
+# Print the version (e.g. go1.27.0) reported by the given Go binary.
+go_version_of() {
+    "$1" version 2>/dev/null | awk '{print $3}' || true
+}
 
 usage() {
     cat <<'EOF'
@@ -77,8 +93,7 @@ EOF
 # --------------------------------------------------
 
 self_update() {
-    local target="${BASH_SOURCE[0]}"
-    local dir self_path new_ver tmp_dir tmp_file
+    local target="${BASH_SOURCE[0]}" dir self_path new_ver tmp_dir tmp_file
 
     # Follow symlinks so we replace the file that actually runs.
     while [[ -L "$target" ]]; do
@@ -102,15 +117,15 @@ self_update() {
     CLEANUP_DIR="$tmp_dir"
     tmp_file="$tmp_dir/update-go.new"
 
-    if ! curl -fsSL --retry 3 --retry-delay 2 \
-            -o "$tmp_file" "https://github.com/$REPO_SLUG/releases/latest/download/update-go"; then
+    if ! fetch -s -o "$tmp_file" \
+            "https://github.com/$REPO_SLUG/releases/latest/download/update-go"; then
         error "Couldn't download the latest update-go from GitHub."
         error "Check your internet connection and try again."
         exit 1
     fi
 
     # Only touch the running copy if the download looks like a healthy script.
-    if ! head -n 1 "$tmp_file" | grep -q '^#!' || ! bash -n "$tmp_file"; then
+    if [[ "$(head -n 1 "$tmp_file")" != '#!'* ]] || ! bash -n "$tmp_file"; then
         error "The downloaded file didn't look like a working update-go."
         error "Nothing was changed — please try again later."
         exit 1
@@ -209,13 +224,14 @@ esac
 
 info "Detecting system architecture..."
 
-case "$(uname -m)" in
+ARCH="$(uname -m)"
+case "$ARCH" in
     x86_64|amd64) GOARCH="amd64" ;;
     aarch64|arm64) GOARCH="arm64" ;;
     i386|i486|i586|i686) GOARCH="386" ;;
     armv6l|armv7l) GOARCH="armv6l" ;;  # Go publishes one 32-bit ARM build; runs on v6 and v7
     *)
-        error "Unsupported architecture: $(uname -m)"
+        error "Unsupported architecture: $ARCH"
         exit 1
         ;;
 esac
@@ -225,14 +241,12 @@ esac
 # --------------------------------------------------
 
 detect_shell() {
-    local shell_name
-    shell_name="$(basename "${SHELL:-/bin/bash}")"
+    SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
 
-    case "$shell_name" in
+    case "$SHELL_NAME" in
         zsh)
             PROFILE="$HOME/.zshrc"
             SHELL_FAMILY="posix"
-            SOURCE_CMD="source \"$PROFILE\""
             ;;
         bash)
             # macOS bash is usually a login shell (uses .bash_profile).
@@ -242,25 +256,24 @@ detect_shell() {
                 PROFILE="$HOME/.bashrc"
             fi
             SHELL_FAMILY="posix"
-            SOURCE_CMD="source \"$PROFILE\""
             ;;
         fish)
             # fish reads $XDG_CONFIG_HOME/fish/config.fish, which defaults
             # to ~/.config/fish/config.fish.
             PROFILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
             SHELL_FAMILY="fish"
-            SOURCE_CMD="source \"$PROFILE\""
             ;;
         *)
             PROFILE="$HOME/.profile"
             SHELL_FAMILY="posix"
-            SOURCE_CMD="source \"$PROFILE\""
             ;;
     esac
+
+    SOURCE_CMD="source \"$PROFILE\""
 }
 
 detect_shell
-info "Detected shell: $(basename "${SHELL:-/bin/bash}")  (editing $PROFILE)"
+info "Detected shell: $SHELL_NAME  (editing $PROFILE)"
 
 # --------------------------------------------------
 # Permissions
@@ -278,13 +291,15 @@ fi
 
 info "Fetching latest Go release information..."
 
-if ! JSON="$(curl -fsSL --retry 3 --retry-delay 2 "https://go.dev/dl/?mode=json")"; then
+if ! JSON="$(fetch -s "https://go.dev/dl/?mode=json")"; then
     error "Could not reach go.dev to fetch release information."
     error "Check your internet connection and try again."
     exit 1
 fi
 
-LATEST_VER="$(jq -r '.[0].version' <<< "$JSON")"
+# A proxy or captive portal can serve non-JSON junk; treat parse failures
+# as "no data" so the checks below can report it kindly.
+LATEST_VER="$(jq -r '.[0].version' <<< "$JSON" 2>/dev/null)" || true
 
 read -r FILENAME EXPECTED_HASH <<< "$(jq -r \
     --arg os "$GOOS" \
@@ -319,9 +334,9 @@ MANAGED_GO="/usr/local/go/bin/go"
 CURRENT_VER=""
 
 if [[ -x "$MANAGED_GO" ]]; then
-    CURRENT_VER="$("$MANAGED_GO" version 2>/dev/null | awk '{print $3}')" || true
+    CURRENT_VER="$(go_version_of "$MANAGED_GO")"
 elif command -v go >/dev/null 2>&1; then
-    CURRENT_VER="$(go version 2>/dev/null | awk '{print $3}')" || true
+    CURRENT_VER="$(go_version_of "go")"
     warn "Found Go ($CURRENT_VER) outside /usr/local/go — installing a fresh copy there."
 fi
 
@@ -344,7 +359,7 @@ CLEANUP_DIR="$(mktemp -d)"
 cd "$CLEANUP_DIR"
 
 info "Downloading ${FILENAME}..."
-if ! curl -fL --progress-bar --retry 3 --retry-delay 2 -O "$DOWNLOAD_URL"; then
+if ! fetch --progress-bar -O "$DOWNLOAD_URL"; then
     error "Download failed. Check your internet connection and try again."
     exit 1
 fi
@@ -386,7 +401,7 @@ info "Installing Go..."
 sudo tar -C /usr/local -xzf "$FILENAME"
 success "Installation complete."
 
-INSTALLED_VER="$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}')" || true
+INSTALLED_VER="$(go_version_of "/usr/local/go/bin/go")"
 if [[ "$INSTALLED_VER" != "$LATEST_VER" ]]; then
     error "Installation looks wrong: /usr/local/go reports '${INSTALLED_VER:-unknown}', expected $LATEST_VER."
     exit 1
@@ -405,7 +420,14 @@ touch "$PROFILE"
 
 profile_has() {
     # True if the profile has a non-comment line mentioning $1.
-    grep -v '^[[:space:]]*#' "$PROFILE" 2>/dev/null | grep -qF "$1"
+    # Pure bash (no pipes) so an early match can't trip up pipefail.
+    local needle="$1" line
+    [[ -r "$PROFILE" ]] || return 1
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" == *"$needle"* ]] && return 0
+    done < "$PROFILE"
+    return 1
 }
 
 add_profile_line() {
