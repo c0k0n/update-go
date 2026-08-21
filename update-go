@@ -117,7 +117,7 @@ detect_shell() {
         zsh)
             PROFILE="$HOME/.zshrc"
             SHELL_FAMILY="posix"
-            SOURCE_CMD="source ~/.zshrc"
+            SOURCE_CMD="source \"$PROFILE\""
             ;;
         bash)
             # macOS bash is usually a login shell (uses .bash_profile).
@@ -127,17 +127,19 @@ detect_shell() {
                 PROFILE="$HOME/.bashrc"
             fi
             SHELL_FAMILY="posix"
-            SOURCE_CMD="source $PROFILE"
+            SOURCE_CMD="source \"$PROFILE\""
             ;;
         fish)
-            PROFILE="$HOME/.config/fish/config.fish"
+            # fish reads $XDG_CONFIG_HOME/fish/config.fish, which defaults
+            # to ~/.config/fish/config.fish.
+            PROFILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
             SHELL_FAMILY="fish"
-            SOURCE_CMD="source $PROFILE"
+            SOURCE_CMD="source \"$PROFILE\""
             ;;
         *)
             PROFILE="$HOME/.profile"
             SHELL_FAMILY="posix"
-            SOURCE_CMD="source $PROFILE"
+            SOURCE_CMD="source \"$PROFILE\""
             ;;
     esac
 }
@@ -308,10 +310,11 @@ ensure_path_entry() {
 }
 
 if [[ "$SHELL_FAMILY" == "fish" ]]; then
+    # fish_add_path is fish's official helper: it deduplicates entries and
+    # keeps them ahead of the system paths.
+    ensure_path_entry "$GO_BIN_LINE" "fish_add_path $GO_BIN_LINE" "Go"
     # shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
-    ensure_path_entry "$GO_BIN_LINE" "set -gx PATH $GO_BIN_LINE \$PATH" "Go"
-    # shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later
-    ensure_path_entry "$GOPATH_BIN_LINE" 'set -gx PATH $PATH (go env GOPATH)/bin' "GOPATH/bin"
+    ensure_path_entry "$GOPATH_BIN_LINE" 'fish_add_path "$(go env GOPATH)/bin"' "GOPATH/bin"
 else
     ensure_path_entry "$GO_BIN_LINE" "export PATH=$GO_BIN_LINE:\$PATH" "Go"
     # shellcheck disable=SC2016  # intentionally literal: expanded by the user's shell later

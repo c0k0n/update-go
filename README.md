@@ -32,7 +32,8 @@ In the order it happens:
   `$SHELL`:
   - **bash** → `~/.bashrc` (Linux) or `~/.bash_profile` (macOS)
   - **zsh** → `~/.zshrc`
-  - **fish** → `~/.config/fish/config.fish`
+  - **fish** → `$XDG_CONFIG_HOME/fish/config.fish` (defaulting to
+    `~/.config/fish/config.fish`), using fish's own `fish_add_path`
 
   Lines your profile already has are skipped, so nothing gets duplicated —
   even if you added Go to your `PATH` by hand long ago.
